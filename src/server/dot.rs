@@ -32,6 +32,10 @@ pub async fn serve(addr: SocketAddr, tls_config: Arc<rustls::ServerConfig>, stat
                 continue;
             }
         };
+        // Without this, Nagle's algorithm can hold small DNS responses back
+        // waiting to coalesce with more outbound data, adding tens of
+        // milliseconds of pure buffering delay per query for no benefit here.
+        tcp.set_nodelay(true).ok();
         let acceptor = acceptor.clone();
         let state = Arc::clone(&state);
         tokio::spawn(async move {
@@ -66,8 +70,12 @@ async fn handle_connection(acceptor: TlsAcceptor, tcp: TcpStream, state: &AppSta
         let response = handle_query(state, &buf).await;
         let resp_len =
             u16::try_from(response.len()).context("encoded response too large for DoT framing")?;
-        tls.write_all(&resp_len.to_be_bytes()).await?;
-        tls.write_all(&response).await?;
+        // One write for the length prefix + body, rather than two, so it's a
+        // single TCP segment instead of two back-to-back ones.
+        let mut framed = Vec::with_capacity(2 + response.len());
+        framed.extend_from_slice(&resp_len.to_be_bytes());
+        framed.extend_from_slice(&response);
+        tls.write_all(&framed).await?;
         tls.flush().await?;
     }
 }
