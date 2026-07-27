@@ -7,7 +7,7 @@ use anyhow::Result;
 use arc_swap::ArcSwap;
 use tracing::{info, warn};
 
-use crate::config::BlocklistSource;
+use crate::config::BlocklistsConfig;
 use crate::util::normalize_name;
 
 /// Lock-free-to-read, hot-swappable set of blocked domains (normalized, trailing-dot form).
@@ -43,19 +43,21 @@ pub struct BlocklistManager {
 }
 
 impl BlocklistManager {
-    pub fn new(sources_cfg: &[BlocklistSource]) -> Self {
+    pub fn new(config: &BlocklistsConfig) -> Self {
         let http = reqwest::Client::builder()
             .user_agent(concat!("dns-rs/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(30))
             .build()
             .expect("failed to build blocklist HTTP client");
 
-        let sources = sources_cfg
+        let refresh_interval = Duration::from_secs(config.refresh_interval_secs);
+        let sources = config
+            .urls
             .iter()
-            .map(|s| {
+            .map(|url| {
                 Arc::new(Source {
-                    url: s.url.clone(),
-                    refresh_interval: Duration::from_secs(s.refresh_interval_secs),
+                    url: url.clone(),
+                    refresh_interval,
                     set: Mutex::new(Arc::new(HashSet::new())),
                 })
             })

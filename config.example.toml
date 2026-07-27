@@ -2,39 +2,46 @@
 # Copy to config.toml (or pass --config <path>) and adjust for your deployment.
 
 [server]
-# Standard DoT/DoH ports require binding as root (or CAP_NET_BIND_SERVICE).
-# Use high ports (as below) for local testing.
-dot_listen = "0.0.0.0:853"
-doh_listen = "0.0.0.0:443"
+# Binds to all interfaces by default. Standard DoT/DoH ports (853/443) require
+# root (or CAP_NET_BIND_SERVICE) — use high ports for local testing instead.
+# bind_address = "0.0.0.0"
+dot_port = 853
+doh_port = 443
 tls_cert = "/etc/dns-rs/fullchain.pem"
 tls_key = "/etc/dns-rs/privkey.pem"
-# TTL used for synthesized static-host and (unless overridden) sinkhole answers.
+# TTL used for synthesized static-host and sinkhole answers.
 default_ttl = 300
 
 [blocking]
-# "nxdomain" or "sinkhole"
+# What a blocked domain gets back:
+#   "nxdomain" - looks like the domain doesn't exist. Simple, works for any query type.
+#   "sinkhole" - resolves successfully, but to sinkhole_ip below instead of its
+#                real address (the classic Pi-hole "IP-based" blocking style).
 mode = "nxdomain"
-sinkhole_ipv4 = "0.0.0.0"
-sinkhole_ipv6 = "::"
+sinkhole_ip = "0.0.0.0"
 
-[[blocklists]]
-url = "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
-refresh_interval_secs = 43200
+[blocklists]
+refresh_interval_secs = 43200  # applies to every URL below
+urls = [
+  "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+]
 
-[[static_hosts]]
-domain = "nas.home"
-addresses = ["192.168.1.10"]
-# ttl = 60  # optional per-entry override of server.default_ttl
+# Upstream resolvers, tried in order. Protocol is inferred from the URL:
+#   https://...        -> DoH
+#   tls://host:port     -> DoT (add #tls_name if it differs from host, e.g.
+#                          connecting to a literal IP but validating against
+#                          the provider's real certificate hostname)
+[upstream]
+urls = [
+  "https://cloudflare-dns.com/dns-query",
+  "tls://1.1.1.1:853#cloudflare-dns.com",
+]
 
-[[upstream]]
-protocol = "doh"
-url = "https://cloudflare-dns.com/dns-query"
-
-[[upstream]]
-protocol = "dot"
-host = "1.1.1.1"
-port = 853
-tls_name = "cloudflare-dns.com"
+# Custom domain -> IP overrides, checked before the blocklist and never
+# forwarded upstream. One line per host.
+[static_hosts]
+"nas.home" = "192.168.1.10"
+# "printer.home" = "192.168.1.20"
 
 [cache]
 enabled = true

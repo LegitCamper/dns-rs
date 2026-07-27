@@ -38,8 +38,8 @@ async fn main() -> Result<()> {
     let state = Arc::new(AppState::build(&config).await?);
     let dot_tls_config = tls::load_server_config(&config.server.tls_cert, &config.server.tls_key)?;
 
-    let dot_addr = config.server.dot_listen;
-    let doh_addr = config.server.doh_listen;
+    let dot_addr = config.server.dot_listen();
+    let doh_addr = config.server.doh_listen();
     let doh_cert = config.server.tls_cert.clone();
     let doh_key = config.server.tls_key.clone();
 

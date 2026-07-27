@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::Ipv4Addr;
 
 use anyhow::Result;
 
@@ -17,8 +17,7 @@ pub struct AppState {
     pub in_flight: InFlightRegistry,
     pub upstreams: UpstreamPool,
     pub block_mode: BlockMode,
-    pub sinkhole_ipv4: Ipv4Addr,
-    pub sinkhole_ipv6: Ipv6Addr,
+    pub sinkhole_ip: Ipv4Addr,
     pub sinkhole_ttl: u32,
 }
 
@@ -29,15 +28,16 @@ impl AppState {
         let blocklist_manager = std::sync::Arc::new(BlocklistManager::new(&config.blocklists));
         blocklist_manager.start().await;
 
+        let upstream_configs = config.parsed_upstreams()?;
+
         Ok(Self {
             static_hosts: config.static_hosts_map(),
             blocklist: blocklist_manager.merged_set(),
             cache: ResponseCache::new(config.cache.enabled, config.cache.max_entries),
             in_flight: InFlightRegistry::new(),
-            upstreams: UpstreamPool::new(&config.upstream)?,
+            upstreams: UpstreamPool::new(&upstream_configs)?,
             block_mode: config.blocking.mode,
-            sinkhole_ipv4: config.blocking.sinkhole_ipv4,
-            sinkhole_ipv6: config.blocking.sinkhole_ipv6,
+            sinkhole_ip: config.blocking.sinkhole_ip,
             sinkhole_ttl: config.server.default_ttl,
         })
     }

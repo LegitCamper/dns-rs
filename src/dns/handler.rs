@@ -1,5 +1,5 @@
 use hickory_proto::op::{Message, OpCode, Query, ResponseCode};
-use hickory_proto::rr::rdata::{AAAA, A};
+use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
 use tracing::{debug, warn};
 
@@ -116,29 +116,15 @@ fn base_response(request: &Message, question: &Query) -> Message {
     response
 }
 
-/// Answers directly from a configured static host entry. Only A/AAAA are
-/// ever synthesized; any other qtype for a static name yields NOERROR/NODATA
-/// rather than being forwarded upstream, since overridden names are never
-/// meant to leak externally.
+/// Answers directly from a configured static host entry. Only A is ever
+/// synthesized (no IPv6 support); any other qtype for a static name yields
+/// NOERROR/NODATA rather than being forwarded upstream, since overridden
+/// names are never meant to leak externally.
 fn static_response(request: &Message, question: &Query, host: &StaticHost) -> Message {
     let mut response = base_response(request, question);
-    let name = question.name.clone();
-    match question.query_type {
-        RecordType::A => {
-            for ip in &host.ipv4 {
-                response.add_answer(Record::from_rdata(name.clone(), host.ttl, RData::A(A::from(*ip))));
-            }
-        }
-        RecordType::AAAA => {
-            for ip in &host.ipv6 {
-                response.add_answer(Record::from_rdata(
-                    name.clone(),
-                    host.ttl,
-                    RData::AAAA(AAAA::from(*ip)),
-                ));
-            }
-        }
-        _ => {}
+    if question.query_type == RecordType::A {
+        let name = question.name.clone();
+        response.add_answer(Record::from_rdata(name, host.ttl, RData::A(A::from(host.ip))));
     }
     response
 }
@@ -150,26 +136,17 @@ fn blocked_response(state: &AppState, request: &Message, question: &Query) -> Me
         BlockMode::Nxdomain => {
             response.metadata.response_code = ResponseCode::NXDomain;
         }
-        BlockMode::Sinkhole => {
+        // Only A gets sinkholed (no IPv6 support); AAAA on a blocked domain
+        // just comes back NOERROR/NODATA, which blocks it just as well.
+        BlockMode::Sinkhole if question.query_type == RecordType::A => {
             let name = question.name.clone();
-            match question.query_type {
-                RecordType::A => {
-                    response.add_answer(Record::from_rdata(
-                        name,
-                        state.sinkhole_ttl,
-                        RData::A(A::from(state.sinkhole_ipv4)),
-                    ));
-                }
-                RecordType::AAAA => {
-                    response.add_answer(Record::from_rdata(
-                        name,
-                        state.sinkhole_ttl,
-                        RData::AAAA(AAAA::from(state.sinkhole_ipv6)),
-                    ));
-                }
-                _ => {}
-            }
+            response.add_answer(Record::from_rdata(
+                name,
+                state.sinkhole_ttl,
+                RData::A(A::from(state.sinkhole_ip)),
+            ));
         }
+        BlockMode::Sinkhole => {}
     }
 
     response
