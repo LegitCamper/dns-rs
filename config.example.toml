@@ -1,0 +1,41 @@
+# Example dns-rs configuration.
+# Copy to config.toml (or pass --config <path>) and adjust for your deployment.
+
+[server]
+# Standard DoT/DoH ports require binding as root (or CAP_NET_BIND_SERVICE).
+# Use high ports (as below) for local testing.
+dot_listen = "0.0.0.0:853"
+doh_listen = "0.0.0.0:443"
+tls_cert = "/etc/dns-rs/fullchain.pem"
+tls_key = "/etc/dns-rs/privkey.pem"
+# TTL used for synthesized static-host and (unless overridden) sinkhole answers.
+default_ttl = 300
+
+[blocking]
+# "nxdomain" or "sinkhole"
+mode = "nxdomain"
+sinkhole_ipv4 = "0.0.0.0"
+sinkhole_ipv6 = "::"
+
+[[blocklists]]
+url = "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+refresh_interval_secs = 43200
+
+[[static_hosts]]
+domain = "nas.home"
+addresses = ["192.168.1.10"]
+# ttl = 60  # optional per-entry override of server.default_ttl
+
+[[upstream]]
+protocol = "doh"
+url = "https://cloudflare-dns.com/dns-query"
+
+[[upstream]]
+protocol = "dot"
+host = "1.1.1.1"
+port = 853
+tls_name = "cloudflare-dns.com"
+
+[cache]
+enabled = true
+max_entries = 10000
