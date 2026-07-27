@@ -6,6 +6,7 @@ use anyhow::Result;
 use crate::blocklist::{BlockSet, BlocklistManager};
 use crate::config::{BlockMode, Config, StaticHost};
 use crate::dns::cache::ResponseCache;
+use crate::dns::inflight::InFlightRegistry;
 use crate::dns::upstream::UpstreamPool;
 
 /// Shared, read-mostly state handed to every DoT/DoH connection handler.
@@ -13,6 +14,7 @@ pub struct AppState {
     pub static_hosts: HashMap<String, StaticHost>,
     pub blocklist: BlockSet,
     pub cache: ResponseCache,
+    pub in_flight: InFlightRegistry,
     pub upstreams: UpstreamPool,
     pub block_mode: BlockMode,
     pub sinkhole_ipv4: Ipv4Addr,
@@ -31,6 +33,7 @@ impl AppState {
             static_hosts: config.static_hosts_map(),
             blocklist: blocklist_manager.merged_set(),
             cache: ResponseCache::new(config.cache.enabled, config.cache.max_entries),
+            in_flight: InFlightRegistry::new(),
             upstreams: UpstreamPool::new(&config.upstream)?,
             block_mode: config.blocking.mode,
             sinkhole_ipv4: config.blocking.sinkhole_ipv4,

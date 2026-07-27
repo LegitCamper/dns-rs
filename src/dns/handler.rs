@@ -1,6 +1,6 @@
 use hickory_proto::op::{Message, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::{AAAA, A};
-use hickory_proto::rr::{RData, Record, RecordType};
+use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
 use tracing::{debug, warn};
 
 use crate::config::{BlockMode, StaticHost};
@@ -57,6 +57,31 @@ async fn resolve(state: &AppState, request: &Message) -> Vec<u8> {
         return encode_or_servfail(&blocked_response(state, request, question), id, op_code);
     }
 
+    // Coalesce concurrent identical misses into a single upstream fetch;
+    // each caller (leader or follower) still patches its own request ID below.
+    let cache_key = qname.clone();
+    let mut wire = state
+        .in_flight
+        .dedup(&qname, qtype, qclass, move || async move {
+            fetch_from_upstream(state, request, cache_key, qtype, qclass, id, op_code).await
+        })
+        .await;
+
+    if wire.len() >= 2 {
+        wire[0..2].copy_from_slice(&id.to_be_bytes());
+    }
+    wire
+}
+
+async fn fetch_from_upstream(
+    state: &AppState,
+    request: &Message,
+    qname: String,
+    qtype: RecordType,
+    qclass: DNSClass,
+    id: u16,
+    op_code: OpCode,
+) -> Vec<u8> {
     match state.upstreams.resolve(request).await {
         Ok(response) => {
             let wire = encode_or_servfail(&response, id, op_code);
