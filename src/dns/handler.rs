@@ -5,7 +5,6 @@ use tracing::{debug, warn};
 
 use crate::config::{BlockMode, StaticHost};
 use crate::state::AppState;
-use crate::util::normalize_name;
 
 /// Parses raw DNS wire bytes, resolves the query against static hosts, the
 /// response cache, the blocklist, and finally upstream, and returns the
@@ -19,65 +18,69 @@ pub async fn handle_query(state: &AppState, raw: &[u8]) -> Vec<u8> {
                 .get(0..2)
                 .map(|b| u16::from_be_bytes([b[0], b[1]]))
                 .unwrap_or(0);
-            let resp = Message::error_msg(id, OpCode::Query, ResponseCode::FormErr);
-            return resp.to_vec().unwrap_or_default();
+            return encode_or_servfail(&Message::error_msg(id, OpCode::Query, ResponseCode::FormErr), id, OpCode::Query);
         }
     };
 
-    let response = resolve(state, &request).await;
-    response.to_vec().unwrap_or_else(|err| {
-        warn!(error = %err, "failed to encode DNS response, returning SERVFAIL");
-        Message::error_msg(
-            request.metadata.id,
-            request.metadata.op_code,
-            ResponseCode::ServFail,
-        )
-        .to_vec()
-        .unwrap_or_default()
-    })
+    resolve(state, &request).await
 }
 
-async fn resolve(state: &AppState, request: &Message) -> Message {
+async fn resolve(state: &AppState, request: &Message) -> Vec<u8> {
+    let id = request.metadata.id;
+    let op_code = request.metadata.op_code;
+
     if request.queries.len() != 1 {
-        return Message::error_msg(
-            request.metadata.id,
-            request.metadata.op_code,
-            ResponseCode::FormErr,
-        );
+        return encode_or_servfail(&Message::error_msg(id, op_code, ResponseCode::FormErr), id, op_code);
     }
     let question = &request.queries[0];
 
-    let qname = normalize_name(&question.name.to_ascii());
+    // Wire-parsed names are always fully-qualified, so `to_ascii()` already
+    // yields the canonical trailing-dot form; only the case needs normalizing,
+    // and doing that in place avoids a second allocation.
+    let mut qname = question.name.to_ascii();
+    qname.make_ascii_lowercase();
     let qtype = question.query_type;
     let qclass = question.query_class;
 
     if let Some(host) = state.static_hosts.get(&qname) {
-        return static_response(request, question, host);
+        return encode_or_servfail(&static_response(request, question, host), id, op_code);
     }
 
-    if let Some(mut cached) = state.cache.get(&qname, qtype, qclass) {
-        cached.metadata.id = request.metadata.id;
-        return cached;
+    if let Some(mut wire) = state.cache.get(&qname, qtype, qclass) {
+        if wire.len() >= 2 {
+            wire[0..2].copy_from_slice(&id.to_be_bytes());
+        }
+        return wire;
     }
 
     if state.blocklist.load().contains(&qname) {
-        return blocked_response(state, request, question);
+        return encode_or_servfail(&blocked_response(state, request, question), id, op_code);
     }
 
     match state.upstreams.resolve(request).await {
         Ok(response) => {
-            state.cache.insert(&qname, qtype, qclass, response.clone());
-            response
+            let wire = encode_or_servfail(&response, id, op_code);
+            if let Some(ttl) = response.answers.iter().map(|r| r.ttl).min() {
+                if ttl > 0 {
+                    state.cache.insert(qname, qtype, qclass, ttl, wire.clone());
+                }
+            }
+            wire
         }
         Err(err) => {
             warn!(error = %err, qname = %qname, "upstream resolution failed");
-            Message::error_msg(
-                request.metadata.id,
-                request.metadata.op_code,
-                ResponseCode::ServFail,
-            )
+            encode_or_servfail(&Message::error_msg(id, op_code, ResponseCode::ServFail), id, op_code)
         }
     }
+}
+
+fn encode_or_servfail(message: &Message, request_id: u16, op_code: OpCode) -> Vec<u8> {
+    message.to_vec().unwrap_or_else(|err| {
+        warn!(error = %err, "failed to encode DNS response, returning SERVFAIL");
+        Message::error_msg(request_id, op_code, ResponseCode::ServFail)
+            .to_vec()
+            .unwrap_or_default()
+    })
 }
 
 fn base_response(request: &Message, question: &Query) -> Message {
