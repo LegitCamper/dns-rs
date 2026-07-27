@@ -118,10 +118,26 @@ fn default_blocklist_refresh_secs() -> u64 {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct UpstreamsConfig {
+    #[serde(default)]
+    pub strategy: UpstreamStrategy,
     /// Plain URL-like strings; the protocol is inferred from the scheme
     /// (`https://` = DoH, `tls://` = DoT). See `UpstreamConfig::parse`.
     #[serde(default)]
     pub urls: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamStrategy {
+    /// Try upstreams one at a time, in order, falling back to the next on
+    /// failure or timeout. One request in flight per query.
+    #[default]
+    Sequential,
+    /// Query every configured upstream at once and use whichever answers
+    /// first — lower worst-case latency, and one upstream having a bad
+    /// moment doesn't cost you the query, at the price of every query
+    /// hitting every configured upstream.
+    Race,
 }
 
 #[derive(Debug, Clone)]
