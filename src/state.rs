@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 
 use anyhow::Result;
+use tokio_util::sync::CancellationToken;
 
 use crate::blocklist::{BlockSet, BlocklistManager};
 use crate::config::{BlockMode, Config, StaticHost};
@@ -26,10 +27,12 @@ pub struct AppState<U: Upstream = SingleUpstream> {
 
 impl AppState<SingleUpstream> {
     /// Builds shared state from config and kicks off the blocklist manager's
-    /// initial fetch + background refresh loops.
-    pub async fn build(config: &Config) -> Result<Self> {
+    /// initial fetch + background refresh loops. `shutdown` stops those
+    /// background loops when cancelled — the caller cancels it when this
+    /// state is being replaced by a config reload.
+    pub async fn build(config: &Config, shutdown: CancellationToken) -> Result<Self> {
         let blocklist_manager = std::sync::Arc::new(BlocklistManager::new(&config.blocklists));
-        blocklist_manager.start().await;
+        blocklist_manager.start(shutdown).await;
 
         let upstream_configs = config.parsed_upstreams()?;
 

@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use arc_swap::ArcSwap;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::config::BlocklistsConfig;
@@ -86,7 +87,11 @@ impl BlocklistManager {
     /// A source that fails to fetch (initially or on refresh) just keeps its
     /// previous contents (empty on first failure) rather than taking the
     /// server down — blocklist availability should fail open, not crash DNS.
-    pub async fn start(self: &Arc<Self>) {
+    ///
+    /// `shutdown` stops the background refresh loops once cancelled, so a
+    /// config reload (which builds a brand-new `BlocklistManager`) doesn't
+    /// leak the old one's tasks running forever alongside the new one's.
+    pub async fn start(self: &Arc<Self>, shutdown: CancellationToken) {
         let mut handles = Vec::with_capacity(self.sources.len());
         for src in &self.sources {
             let this = Arc::clone(self);
@@ -107,9 +112,13 @@ impl BlocklistManager {
         for src in &self.sources {
             let this = Arc::clone(self);
             let src = Arc::clone(src);
+            let shutdown = shutdown.clone();
             tokio::spawn(async move {
                 loop {
-                    tokio::time::sleep(src.refresh_interval).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(src.refresh_interval) => {}
+                        _ = shutdown.cancelled() => return,
+                    }
                     this.fetch_and_store(&src).await;
                     this.republish_merged();
                 }

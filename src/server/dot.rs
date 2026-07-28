@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::dns::handler::handle_query;
@@ -17,7 +18,16 @@ const MAX_MESSAGE_SIZE: usize = 65535;
 /// RFC 7858 DNS-over-TLS listener: plain TCP + TLS, with each message framed
 /// by a 2-byte big-endian length prefix (the same framing classic DNS-over-TCP
 /// uses). A connection may carry multiple pipelined queries.
-pub async fn serve(addr: SocketAddr, tls_config: Arc<rustls::ServerConfig>, state: Arc<AppState>) -> Result<()> {
+///
+/// Stops accepting new connections and returns once `shutdown` is cancelled
+/// (used for config-reload restarts); already-accepted connections are left
+/// to finish on their own rather than being cut off.
+pub async fn serve(
+    addr: SocketAddr,
+    tls_config: Arc<rustls::ServerConfig>,
+    state: Arc<AppState>,
+    shutdown: CancellationToken,
+) -> Result<()> {
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind DoT listener on {addr}"))?;
@@ -25,12 +35,18 @@ pub async fn serve(addr: SocketAddr, tls_config: Arc<rustls::ServerConfig>, stat
     info!(%addr, "DoT listener ready");
 
     loop {
-        let (tcp, peer) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(err) => {
-                warn!(error = %err, "failed to accept DoT connection");
-                continue;
+        let (tcp, peer) = tokio::select! {
+            () = shutdown.cancelled() => {
+                info!(%addr, "DoT listener shutting down");
+                return Ok(());
             }
+            accepted = listener.accept() => match accepted {
+                Ok(pair) => pair,
+                Err(err) => {
+                    warn!(error = %err, "failed to accept DoT connection");
+                    continue;
+                }
+            },
         };
         // Without this, Nagle's algorithm can hold small DNS responses back
         // waiting to coalesce with more outbound data, adding tens of
