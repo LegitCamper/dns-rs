@@ -101,6 +101,10 @@ pub struct BlocklistsConfig {
     pub urls: Vec<String>,
     #[serde(default = "default_blocklist_refresh_secs")]
     pub refresh_interval_secs: u64,
+    /// Domains that must never be blocked, even if a source lists them.
+    /// Checked as exact names (like the blocklist itself), not subdomains.
+    #[serde(default)]
+    pub whitelist: Vec<String>,
 }
 
 impl Default for BlocklistsConfig {
@@ -108,6 +112,7 @@ impl Default for BlocklistsConfig {
         Self {
             urls: Vec::new(),
             refresh_interval_secs: default_blocklist_refresh_secs(),
+            whitelist: Vec::new(),
         }
     }
 }

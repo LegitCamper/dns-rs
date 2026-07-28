@@ -39,6 +39,10 @@ struct Source {
 pub struct BlocklistManager {
     http: reqwest::Client,
     sources: Vec<Arc<Source>>,
+    /// Normalized names that must never end up in `merged`, even if a source
+    /// lists them — subtracted out every time `merged` is rebuilt, so a
+    /// background refresh can never bring a whitelisted domain back.
+    whitelist: HashSet<String>,
     merged: BlockSet,
 }
 
@@ -63,9 +67,12 @@ impl BlocklistManager {
             })
             .collect();
 
+        let whitelist = config.whitelist.iter().map(|d| normalize_name(d)).collect();
+
         Self {
             http,
             sources,
+            whitelist,
             merged: Arc::new(ArcSwap::from_pointee(HashSet::new())),
         }
     }
@@ -93,6 +100,7 @@ impl BlocklistManager {
         info!(
             domains = self.merged.load().len(),
             sources = self.sources.len(),
+            whitelisted = self.whitelist.len(),
             "initial blocklist fetch complete"
         );
 
@@ -133,6 +141,9 @@ impl BlocklistManager {
         for src in &self.sources {
             let snapshot = src.set.lock().unwrap().clone();
             merged.extend(snapshot.iter().cloned());
+        }
+        for domain in &self.whitelist {
+            merged.remove(domain);
         }
         self.merged.store(Arc::new(merged));
     }
@@ -242,6 +253,29 @@ fn looks_like_domain(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn whitelist_removes_domains_from_merged_set_even_after_refresh() {
+        let config = BlocklistsConfig {
+            urls: vec!["https://example.invalid/list.txt".to_string()],
+            refresh_interval_secs: 43_200,
+            whitelist: vec!["s.youtube.com".to_string()],
+        };
+        let manager = BlocklistManager::new(&config);
+
+        // Simulate a source fetch landing entries directly, then re-derive
+        // the merged set the same way a background refresh would.
+        *manager.sources[0].set.lock().unwrap() =
+            Arc::new(HashSet::from(["ads.example.com.".to_string(), "s.youtube.com.".to_string()]));
+        manager.republish_merged();
+
+        let merged = manager.merged_set();
+        assert!(merged.load().contains("ads.example.com."));
+        assert!(
+            !merged.load().contains("s.youtube.com."),
+            "whitelisted domain must never appear in the merged set, even though a source lists it"
+        );
+    }
 
     #[test]
     fn parses_hosts_format() {

@@ -26,6 +26,12 @@ urls = [
   "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
 ]
 
+# Domains that must never be blocked, even if a source above lists them.
+# Checked as exact names, same as the blocklist itself (not by subdomain).
+whitelist = [
+  # "s.youtube.com",
+]
+
 # Upstream resolvers. Protocol is inferred from the URL:
 #   https://...        -> DoH
 #   tls://host:port     -> DoT (add #tls_name if it differs from host, e.g.
