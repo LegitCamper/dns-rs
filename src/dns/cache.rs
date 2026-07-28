@@ -1,14 +1,17 @@
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use hickory_proto::rr::{DNSClass, RecordType};
+use lru::LruCache;
 use tracing::debug;
 
 struct CacheEntry {
     wire: Vec<u8>,
     expires_at: Instant,
 }
+
+type CacheKey = (RecordType, DNSClass, String);
 
 /// TTL-aware in-memory cache of upstream responses' encoded wire bytes,
 /// keyed by (qtype, qclass, qname). Never caches blocklist/static-host
@@ -17,21 +20,30 @@ struct CacheEntry {
 ///
 /// Storing the already-encoded bytes (rather than a parsed `Message`) means a
 /// cache hit only needs a byte-vec clone plus a 2-byte ID patch, skipping a
-/// full DNS re-encode. Nesting by (qtype, qclass) first lets a lookup borrow
-/// `name: &str` straight into the inner `HashMap<String, _>` with no
-/// allocation, since `String` already implements `Borrow<str>`.
+/// full DNS re-encode.
+///
+/// Eviction is LRU, not "reject new entries once full": once `max_entries`
+/// live entries are held, inserting a new name evicts whichever entry (of
+/// any qtype/qclass) was least recently *read*, not just least recently
+/// inserted. `get` counts as a touch, so a name that keeps getting queried
+/// stays resident while cold ones age out — a name that falls out and comes
+/// back is indistinguishable from a first-ever query, since nothing besides
+/// eviction order is tracked. That's an acceptable trade for a resolver-scale
+/// cache; if the working set legitimately thrashes against `max_entries`, the
+/// fix is a bigger cache, not a fancier eviction policy.
 pub struct ResponseCache {
     enabled: bool,
-    max_entries: usize,
-    entries: Mutex<HashMap<(RecordType, DNSClass), HashMap<String, CacheEntry>>>,
+    entries: Mutex<LruCache<CacheKey, CacheEntry>>,
 }
 
 impl ResponseCache {
     pub fn new(enabled: bool, max_entries: usize) -> Self {
+        // LruCache requires a nonzero capacity; a configured 0 is treated the
+        // same as `enabled = false` since nothing could ever be stored anyway.
+        let capacity = NonZeroUsize::new(max_entries).unwrap_or(NonZeroUsize::MIN);
         Self {
-            enabled,
-            max_entries,
-            entries: Mutex::new(HashMap::new()),
+            enabled: enabled && max_entries > 0,
+            entries: Mutex::new(LruCache::new(capacity)),
         }
     }
 
@@ -41,12 +53,12 @@ impl ResponseCache {
         if !self.enabled {
             return None;
         }
+        let key = (record_type, dns_class, name.to_string());
         let mut entries = self.entries.lock().unwrap();
-        let bucket = entries.get_mut(&(record_type, dns_class))?;
-        match bucket.get(name) {
+        match entries.get(&key) {
             Some(entry) if entry.expires_at > Instant::now() => Some(entry.wire.clone()),
             Some(_) => {
-                bucket.remove(name);
+                entries.pop(&key);
                 None
             }
             None => None,
@@ -56,39 +68,56 @@ impl ResponseCache {
     /// Stores an upstream response's encoded wire bytes under the given TTL
     /// (the caller derives this from the response's answer records and should
     /// skip calling `insert` at all for a zero/absent TTL, since that means
-    /// "don't cache").
+    /// "don't cache"). If the cache is already at capacity, this evicts the
+    /// least-recently-used entry to make room.
     pub fn insert(&self, name: String, record_type: RecordType, dns_class: DNSClass, ttl: u32, wire: Vec<u8>) {
         if !self.enabled {
             return;
         }
+        let key = (record_type, dns_class, name);
+        let entry = CacheEntry {
+            wire,
+            expires_at: Instant::now() + Duration::from_secs(u64::from(ttl)),
+        };
+
         let mut entries = self.entries.lock().unwrap();
-
-        let already_present = entries
-            .get(&(record_type, dns_class))
-            .is_some_and(|bucket| bucket.contains_key(&name));
-
-        if !already_present {
-            let total: usize = entries.values().map(HashMap::len).sum();
-            if total >= self.max_entries {
-                let now = Instant::now();
-                for bucket in entries.values_mut() {
-                    bucket.retain(|_, entry| entry.expires_at > now);
-                }
-                let total: usize = entries.values().map(HashMap::len).sum();
-                debug!(total, max_entries = self.max_entries, "cache full, swept expired entries");
-                if total >= self.max_entries {
-                    debug!(name, "cache still full after sweep, not caching this entry");
-                    return;
-                }
-            }
+        let is_new_key = !entries.contains(&key);
+        if let Some((evicted_key, _)) = entries.push(key, entry)
+            && is_new_key
+        {
+            let (evicted_type, _, evicted_name) = &evicted_key;
+            debug!(name = %evicted_name, record_type = ?evicted_type, "evicted least-recently-used cache entry to make room");
         }
+    }
+}
 
-        entries.entry((record_type, dns_class)).or_default().insert(
-            name,
-            CacheEntry {
-                wire,
-                expires_at: Instant::now() + Duration::from_secs(u64::from(ttl)),
-            },
-        );
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const A: RecordType = RecordType::A;
+    const IN: DNSClass = DNSClass::IN;
+
+    #[test]
+    fn evicts_least_recently_used_entry_when_full() {
+        let cache = ResponseCache::new(true, 2);
+        cache.insert("a.".to_string(), A, IN, 60, vec![1]);
+        cache.insert("b.".to_string(), A, IN, 60, vec![2]);
+
+        // Touching "a" makes "b" the least-recently-used entry.
+        assert!(cache.get("a.", A, IN).is_some());
+
+        cache.insert("c.".to_string(), A, IN, 60, vec![3]);
+
+        assert!(cache.get("a.", A, IN).is_some(), "recently-touched entry should survive eviction");
+        assert!(cache.get("c.", A, IN).is_some(), "newly-inserted entry should be present");
+        assert!(cache.get("b.", A, IN).is_none(), "least-recently-used entry should have been evicted");
+    }
+
+    #[test]
+    fn zero_max_entries_disables_caching_instead_of_panicking() {
+        let cache = ResponseCache::new(true, 0);
+        cache.insert("a.".to_string(), A, IN, 60, vec![1]);
+        assert!(cache.get("a.", A, IN).is_none());
     }
 }
