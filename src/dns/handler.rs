@@ -48,11 +48,13 @@ async fn resolve<U: Upstream>(state: &AppState<U>, request: &Message) -> Vec<u8>
     }
 
     if let Some(mut wire) = state.cache.get(&qname, qtype, qclass) {
+        debug!(%qname, ?qtype, "cache hit");
         if wire.len() >= 2 {
             wire[0..2].copy_from_slice(&id.to_be_bytes());
         }
         return wire;
     }
+    debug!(%qname, ?qtype, "cache miss");
 
     if state.blocklist.load().contains(&qname) {
         return encode_or_servfail(&blocked_response(state, request, question), id, op_code);
@@ -86,10 +88,12 @@ async fn fetch_from_upstream<U: Upstream>(
     match state.upstreams.resolve(request).await {
         Ok(response) => {
             let wire = encode_or_servfail(&response, id, op_code);
-            if let Some(ttl) = response.answers.iter().map(|r| r.ttl).min() {
-                if ttl > 0 {
+            match response.answers.iter().map(|r| r.ttl).min() {
+                Some(ttl) if ttl > 0 => {
+                    debug!(%qname, ?qtype, ttl, "caching upstream response");
                     state.cache.insert(qname, qtype, qclass, ttl, wire.clone());
                 }
+                _ => debug!(%qname, ?qtype, "not caching (no TTL-bearing answers)"),
             }
             wire
         }

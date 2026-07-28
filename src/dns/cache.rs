@@ -3,6 +3,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use hickory_proto::rr::{DNSClass, RecordType};
+use tracing::debug;
 
 struct CacheEntry {
     wire: Vec<u8>,
@@ -74,7 +75,9 @@ impl ResponseCache {
                     bucket.retain(|_, entry| entry.expires_at > now);
                 }
                 let total: usize = entries.values().map(HashMap::len).sum();
+                debug!(total, max_entries = self.max_entries, "cache full, swept expired entries");
                 if total >= self.max_entries {
+                    debug!(name, "cache still full after sweep, not caching this entry");
                     return;
                 }
             }
