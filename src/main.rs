@@ -20,10 +20,9 @@ use tracing_subscriber::EnvFilter;
 use config::Config;
 use state::AppState;
 
-/// How often the config file is checked for changes. Polling (rather than
-/// inotify/`notify`) is deliberate: it's trivially correct across the
-/// atomic-rename-based writes tools like Ansible use, needs no extra
-/// dependency, and a few seconds of reload latency is a non-issue here.
+/// Polling (not inotify) is deliberate: trivially correct across
+/// atomic-rename config writes, no extra dependency, and reload latency of a
+/// few seconds is a non-issue here.
 const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Parser)]
@@ -34,8 +33,8 @@ struct Cli {
     config: PathBuf,
 }
 
-/// A loaded config plus the raw text it was parsed from, so a later poll can
-/// cheaply detect "did the file actually change" before paying for a re-parse.
+/// Raw text kept alongside the parsed config so a later poll can cheaply
+/// check "did the file actually change" before re-parsing.
 struct LoadedConfig {
     config: Config,
     raw: String,
@@ -104,13 +103,10 @@ enum Outcome {
     Reload(Box<LoadedConfig>),
 }
 
-/// Waits for whichever comes first: a listener task ending (error or, in
-/// practice, never on success since they only return after `shutdown`),
-/// Ctrl-C, or the config file changing on disk. Either of the latter two
-/// triggers `shutdown` and waits for both listener tasks — and every
-/// background task hanging off the same token, like blocklist refreshes —
-/// to actually stop before this returns, so the next loop iteration never
-/// tries to rebind a port the previous generation is still holding.
+/// Waits for a listener to exit, Ctrl-C, or the config file changing.
+/// Ctrl-C/reload both cancel `shutdown` and wait for every task hanging off
+/// it to stop, so the next loop iteration never fights the previous
+/// generation for a port.
 async fn wait_for_reload_or_exit(
     config_path: &Path,
     current_raw: &str,

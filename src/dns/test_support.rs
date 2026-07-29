@@ -12,11 +12,9 @@ use hickory_proto::rr::{Name, RData, Record};
 
 use crate::dns::upstream::Upstream;
 
-/// A fake upstream: answers with a fixed IP, a negative response (NXDOMAIN or
-/// NODATA, optionally with an SOA authority record), or fails outright —
-/// after an optional delay, without touching the network. Counts how many
-/// times it was actually queried, so tests can assert fallback/dedup/caching
-/// call counts.
+/// A fake upstream, no network involved: answers, fails, or returns a
+/// negative response, after an optional delay. Tracks call count for
+/// fallback/dedup/caching assertions.
 pub(crate) struct TestUpstream {
     label: String,
     outcome: Outcome,

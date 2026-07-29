@@ -9,24 +9,14 @@ use linked_list_allocator::Heap;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
-/// How often the background sweeper (`ResponseCache::start_ttl_sweeper`)
-/// scans for and evicts expired entries. A tradeoff between how much dead
-/// weight can accumulate between sweeps and how often a full scan briefly
-/// holds the cache lock; DNS TTLs are rarely under this, so most expired
-/// entries are caught well before anything on the request path would have
-/// needed to reclaim their space anyway.
+/// How often the background sweeper evicts expired entries.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Maximum wire-format domain name length (RFC 1035 §3.1) — the hard upper
-/// bound used to size each key's inline name storage. A name is stored
-/// inline (fixed-size array, no heap `String`) so a lookup never needs to
-/// allocate just to build a key to compare against.
+/// RFC 1035 wire-format name length limit; names are stored inline
+/// (fixed-size array) so a lookup never has to allocate a `String`.
 const MAX_NAME_LEN: usize = 255;
 
-/// Below this, there isn't even enough room for the allocator's own
-/// bookkeeping (`linked_list_allocator` panics if given a region smaller
-/// than a few words) — treated the same as `enabled = false`, since nothing
-/// meaningful could ever be cached in it anyway.
+/// Below this, `linked_list_allocator` can't even fit its own bookkeeping.
 const MIN_POOL_BYTES: u64 = 64;
 
 #[derive(Clone, Copy)]
@@ -49,9 +39,7 @@ impl InlineName {
         &self.bytes[..self.len as usize]
     }
 
-    /// Domain names reaching this cache are always normalized ASCII
-    /// (lowercased wire names), so this is purely for `debug!` logging —
-    /// never trusted for anything that affects correctness.
+    /// For logging only; never relied on for correctness.
     fn as_str(&self) -> &str {
         std::str::from_utf8(self.as_bytes()).unwrap_or("<invalid-utf8>")
     }
@@ -73,11 +61,9 @@ impl std::hash::Hash for InlineName {
 
 type CacheKey = (RecordType, DNSClass, InlineName);
 
-/// Bookkeeping for one cached response. The bytes themselves live in
-/// `CacheState::pool` at `[offset, offset + len)` — storing the offset
-/// rather than a pointer keeps this (and so the whole cache) trivially
-/// `Send`/`Sync`, since a `usize` carries no aliasing/lifetime baggage the
-/// way a raw pointer into the pool would.
+/// One cached response's bookkeeping. Bytes live in `CacheState::pool` at
+/// `[offset, offset + len)` — an offset instead of a pointer keeps this
+/// (and the whole cache) auto-`Send`/`Sync`.
 struct EntryMeta {
     offset: usize,
     len: usize,
@@ -86,50 +72,20 @@ struct EntryMeta {
     next: Option<CacheKey>,
 }
 
-/// TTL-aware in-memory cache of upstream responses' encoded wire bytes,
-/// keyed by (qtype, qclass, qname). Never caches blocklist/static-host
-/// answers — only genuine upstream responses, since those are the only ones
-/// worth saving a round trip for.
-///
-/// Storage is one preallocated arena (`CacheState::pool`, exactly
-/// `max_size_bytes`, allocated once at construction and never resized) that
-/// individual responses are dynamically suballocated from via
-/// `linked_list_allocator`, a small first-fit allocator with free-block
-/// coalescing — each response uses exactly as many bytes as it needs, not a
-/// fixed slot sized for the worst case. Fragmentation is the allocator's
-/// problem to manage (coalescing adjacent free blocks on every dealloc), not
-/// something this cache reasons about directly.
-///
-/// Capacity is therefore "as many responses as currently fit," which varies
-/// with their actual sizes. When an allocation doesn't fit, `insert` evicts
-/// to make room: first any *expired* entry (freeing dead weight before
-/// evicting anything still theoretically useful), then the least-recently
-/// *read* entry, one at a time, retrying the allocation after each, until it
-/// fits or the cache is completely empty (meaning the response is simply too
-/// big for the configured pool — it's skipped, not cached).
-///
-/// The one heap allocation this cache still performs is `get`'s return
-/// value: callers need an owned `Vec<u8>` to patch the message ID into and
-/// hand to the socket, so a cache hit costs one copy out of the pool. That's
-/// unavoidable without holding the cache lock across the socket write, which
-/// would hurt concurrency for a dubious win.
-///
-/// Expired entries are also reclaimed proactively: `start_ttl_sweeper` spawns
-/// a background task that periodically evicts anything past its TTL, so a
-/// request that needs to `insert` a new response usually doesn't have to
-/// scan for and evict dead entries itself first — that work already
-/// happened off the request path. It's a complement to, not a replacement
-/// for, the eviction `insert` still does on demand for space taken by
-/// still-live entries, which can only ever be discovered reactively.
+/// TTL-aware cache of upstream responses' wire bytes, keyed by (qtype,
+/// qclass, qname). Storage is one preallocated arena (`max_size_bytes`,
+/// allocated once and never resized); responses are suballocated from it via
+/// `linked_list_allocator`, so each one uses only the bytes it needs. When
+/// full, `insert` evicts expired entries first, then LRU, until the new
+/// response fits (or gives up if it never will). `start_ttl_sweeper` also
+/// reclaims expired entries in the background so `insert` usually doesn't
+/// have to.
 pub struct ResponseCache {
     enabled: bool,
     state: Mutex<CacheState>,
 }
 
 struct CacheState {
-    /// The entire cache's storage: one allocation made once in
-    /// `ResponseCache::new`, never resized afterward. `heap` suballocates
-    /// out of this same memory.
     pool: Box<[u8]>,
     heap: Heap,
     entries: HashMap<CacheKey, EntryMeta>,
@@ -144,10 +100,7 @@ impl ResponseCache {
 
         let mut pool = vec![0u8; size].into_boxed_slice();
         let heap = if size > 0 {
-            // SAFETY: `pool` is exactly `size` bytes, owned solely by this
-            // `CacheState`, and never resized or moved out from under
-            // `heap` for as long as both live — a `Box<[u8]>`'s backing
-            // allocation is fixed-size and never reallocated.
+            // SAFETY: `pool` is exactly `size` bytes and never moves or resizes.
             unsafe { Heap::new(pool.as_mut_ptr(), pool.len()) }
         } else {
             Heap::empty()
@@ -165,10 +118,7 @@ impl ResponseCache {
         }
     }
 
-    /// Spawns a background task that evicts expired entries every
-    /// `SWEEP_INTERVAL`, until `shutdown` is cancelled (the caller cancels it
-    /// when this cache is being replaced by a config reload). A no-op when
-    /// the cache is disabled.
+    /// Spawns a background sweep loop until `shutdown` fires. No-op if disabled.
     pub fn start_ttl_sweeper(self: &Arc<Self>, shutdown: CancellationToken) {
         self.start_ttl_sweeper_with_interval(shutdown, SWEEP_INTERVAL);
     }
@@ -189,8 +139,7 @@ impl ResponseCache {
         });
     }
 
-    /// Evicts every currently-expired entry in one pass. Called periodically
-    /// by `start_ttl_sweeper`; also safe to call directly (e.g. from tests).
+    /// Evicts every currently-expired entry.
     pub fn evict_expired(&self) {
         if !self.enabled {
             return;
@@ -231,13 +180,8 @@ impl ResponseCache {
         Some(state.pool[offset..offset + len].to_vec())
     }
 
-    /// Stores an upstream response's encoded wire bytes under the given TTL
-    /// (the caller derives this from the response's answer records, or an
-    /// RFC 2308 negative-cache TTL, and should skip calling `insert` at all
-    /// for a zero/absent TTL, since that means "don't cache"). If the pool
-    /// doesn't have room, evicts expired entries and then least-recently-used
-    /// ones until it does, or gives up and doesn't cache if the response
-    /// can't fit even in an empty pool.
+    /// Stores wire bytes under the given TTL. A zero TTL means "don't cache" -
+    /// callers should just skip calling this instead.
     pub fn insert(&self, name: String, record_type: RecordType, dns_class: DNSClass, ttl: u32, wire: Vec<u8>) {
         if !self.enabled {
             return;
@@ -254,9 +198,7 @@ impl ResponseCache {
 
         let mut state = self.state.lock().unwrap();
 
-        // Already cached under this key: free its old allocation first, both
-        // to let the allocator reuse the space and so it's never picked as
-        // an eviction victim for its own replacement.
+        // Replace in place rather than evict-then-insert.
         if state.entries.contains_key(&key) {
             state.evict(key);
         }
@@ -288,12 +230,9 @@ impl ResponseCache {
 }
 
 impl CacheState {
-    /// Deallocates the pool memory backing `meta`. Must be called exactly
-    /// once per allocation, with the same offset/length `insert` recorded.
+    /// Frees the pool memory backing `meta`. Callers must not use it twice.
     fn free(&mut self, meta: &EntryMeta) {
-        // SAFETY: `offset`/`len` came verbatim from a previous
-        // `heap.allocate_first_fit` call, and `evict` (this method's only
-        // caller) never runs twice for the same entry.
+        // SAFETY: offset/len came from a matching `allocate_first_fit` call.
         unsafe {
             let ptr = NonNull::new_unchecked(self.pool.as_mut_ptr().add(meta.offset));
             self.heap.deallocate(ptr, Layout::from_size_align(meta.len, 1).unwrap());
@@ -340,8 +279,6 @@ impl CacheState {
         self.attach_front(key);
     }
 
-    /// Removes `key` entirely: unlinks it from the LRU list, drops its
-    /// bookkeeping, and frees its pool memory back to the allocator.
     fn evict(&mut self, key: CacheKey) {
         self.unlink(key);
         if let Some(meta) = self.entries.remove(&key) {
@@ -349,11 +286,8 @@ impl CacheState {
         }
     }
 
-    /// Evicts one entry to make room for a pending allocation: an expired
-    /// entry if one exists (found by scanning — cheap relative to how rarely
-    /// this runs, only when the allocator is already out of space), else the
-    /// least-recently-used live entry. Returns false if there's nothing left
-    /// to evict (the cache is empty).
+    /// Evicts an expired entry if one exists, else the LRU entry. Returns
+    /// false if the cache is empty.
     fn evict_one_for_space(&mut self) -> bool {
         let now = Instant::now();
         let victim = self.entries.iter().find(|(_, m)| m.expires_at <= now).map(|(k, _)| *k).or(self.lru_tail);

@@ -12,9 +12,8 @@ use crate::dns::inflight::InFlightRegistry;
 use crate::dns::upstream::{self, MultiUpstream, SingleUpstream, Upstream};
 
 /// Shared, read-mostly state handed to every DoT/DoH connection handler.
-/// Generic over the upstream implementation so tests can substitute a fake
-/// upstream with no real network/TLS involved; production always uses the
-/// default, `SingleUpstream`.
+/// Generic over `Upstream` so tests can substitute a fake with no real
+/// network/TLS involved; production uses the default, `SingleUpstream`.
 pub struct AppState<U: Upstream = SingleUpstream> {
     pub static_hosts: HashMap<String, StaticHost>,
     pub blocklist: BlockSet,
@@ -27,11 +26,9 @@ pub struct AppState<U: Upstream = SingleUpstream> {
 }
 
 impl AppState<SingleUpstream> {
-    /// Builds shared state from config and kicks off the blocklist manager's
-    /// initial fetch + background refresh loops, plus the cache's background
-    /// TTL sweeper. `shutdown` stops those background loops when cancelled —
-    /// the caller cancels it when this state is being replaced by a config
-    /// reload.
+    /// Builds shared state and starts the blocklist refresh loop and cache
+    /// TTL sweeper. `shutdown` stops both when this state is replaced by a
+    /// config reload.
     pub async fn build(config: &Config, shutdown: CancellationToken) -> Result<Self> {
         let blocklist_manager = Arc::new(BlocklistManager::new(&config.blocklists, &config.whitelist));
         blocklist_manager.start(shutdown.clone()).await;
