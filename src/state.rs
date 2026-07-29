@@ -31,7 +31,7 @@ impl AppState<SingleUpstream> {
     /// background loops when cancelled — the caller cancels it when this
     /// state is being replaced by a config reload.
     pub async fn build(config: &Config, shutdown: CancellationToken) -> Result<Self> {
-        let blocklist_manager = std::sync::Arc::new(BlocklistManager::new(&config.blocklists));
+        let blocklist_manager = std::sync::Arc::new(BlocklistManager::new(&config.blocklists, &config.whitelist));
         blocklist_manager.start(shutdown).await;
 
         let upstream_configs = config.parsed_upstreams()?;

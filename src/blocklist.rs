@@ -8,7 +8,7 @@ use arc_swap::ArcSwap;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::config::BlocklistsConfig;
+use crate::config::{BlocklistsConfig, WhitelistConfig};
 use crate::util::normalize_name;
 
 /// Lock-free-to-read, hot-swappable set of blocked domains (normalized, trailing-dot form).
@@ -48,7 +48,7 @@ pub struct BlocklistManager {
 }
 
 impl BlocklistManager {
-    pub fn new(config: &BlocklistsConfig) -> Self {
+    pub fn new(config: &BlocklistsConfig, whitelist: &WhitelistConfig) -> Self {
         let http = reqwest::Client::builder()
             .user_agent(concat!("dns-rs/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(30))
@@ -68,7 +68,7 @@ impl BlocklistManager {
             })
             .collect();
 
-        let whitelist = config.whitelist.iter().map(|d| normalize_name(d)).collect();
+        let whitelist = whitelist.domains.iter().map(|d| normalize_name(d)).collect();
 
         Self {
             http,
@@ -268,9 +268,11 @@ mod tests {
         let config = BlocklistsConfig {
             urls: vec!["https://example.invalid/list.txt".to_string()],
             refresh_interval_secs: 43_200,
-            whitelist: vec!["s.youtube.com".to_string()],
         };
-        let manager = BlocklistManager::new(&config);
+        let whitelist = WhitelistConfig {
+            domains: vec!["s.youtube.com".to_string()],
+        };
+        let manager = BlocklistManager::new(&config, &whitelist);
 
         // Simulate a source fetch landing entries directly, then re-derive
         // the merged set the same way a background refresh would.

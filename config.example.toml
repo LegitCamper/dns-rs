@@ -26,9 +26,12 @@ urls = [
   "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
 ]
 
-# Domains that must never be blocked, even if a source above lists them.
-# Checked as exact names, same as the blocklist itself (not by subdomain).
-whitelist = [
+[whitelist]
+# Unlike [blocklists] above, this is NOT a list of URLs to fetch - just plain
+# domain names that must never be blocked, even if a source in [blocklists]
+# lists them. Checked as exact names, same as the blocklist itself (not by
+# subdomain).
+domains = [
   # "s.youtube.com",
 ]
 

@@ -14,6 +14,8 @@ pub struct Config {
     pub blocking: BlockingConfig,
     #[serde(default)]
     pub blocklists: BlocklistsConfig,
+    #[serde(default)]
+    pub whitelist: WhitelistConfig,
     /// `"domain" = "ip"` pairs — see the example config for the format.
     #[serde(default)]
     pub static_hosts: HashMap<String, Ipv4Addr>,
@@ -101,10 +103,6 @@ pub struct BlocklistsConfig {
     pub urls: Vec<String>,
     #[serde(default = "default_blocklist_refresh_secs")]
     pub refresh_interval_secs: u64,
-    /// Domains that must never be blocked, even if a source lists them.
-    /// Checked as exact names (like the blocklist itself), not subdomains.
-    #[serde(default)]
-    pub whitelist: Vec<String>,
 }
 
 impl Default for BlocklistsConfig {
@@ -112,13 +110,21 @@ impl Default for BlocklistsConfig {
         Self {
             urls: Vec::new(),
             refresh_interval_secs: default_blocklist_refresh_secs(),
-            whitelist: Vec::new(),
         }
     }
 }
 
 fn default_blocklist_refresh_secs() -> u64 {
     43_200 // 12h
+}
+
+/// Unlike `[blocklists]`, this isn't a list of URLs to fetch — just literal
+/// domain names that must never be blocked, even if a source in
+/// `[blocklists]` lists them. Checked as exact names, not by subdomain.
+#[derive(Debug, Default, Deserialize)]
+pub struct WhitelistConfig {
+    #[serde(default)]
+    pub domains: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
