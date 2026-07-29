@@ -18,26 +18,20 @@ use tracing::warn;
 use crate::config::{UpstreamConfig, UpstreamStrategy};
 
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
-/// How many idle DoT connections to keep warm per upstream. Concurrent
-/// queries beyond this just open extra connections rather than blocking;
-/// only the idle *retention* is capped.
+/// Idle DoT connections kept warm per upstream; only retention is capped,
+/// not concurrent use.
 const MAX_IDLE_DOT_CONNECTIONS: usize = 8;
 
-/// A single upstream resolver capable of answering a query. Implemented by
-/// the real network-backed `SingleUpstream`, and by test doubles that never
-/// touch the network — see `dns::upstream::tests` and `MultiUpstream`'s own
-/// tests for how that's used to exercise fallback/race behavior directly.
+/// A single upstream resolver. Implemented by the real `SingleUpstream` and
+/// by network-free test doubles (see `test_support`).
 pub trait Upstream: Send + Sync {
     fn label(&self) -> &str;
     fn resolve(&self, query: &Message) -> impl Future<Output = Result<Message>> + Send;
 }
 
-/// A small pool of persistent, reusable DoT connections to a single upstream.
-/// RFC 7858 recommends keeping connections open rather than paying a fresh
-/// TCP+TLS handshake per query, which otherwise dominates uncached query
-/// latency. There's no in-flight multiplexing here (each checked-out
-/// connection is used for exactly one query/response before being returned),
-/// but avoiding the handshake on the warm path is the bulk of the win.
+/// Persistent, reusable DoT connections to one upstream, avoiding a fresh
+/// TCP+TLS handshake per query (RFC 7858). No in-flight multiplexing — each
+/// checked-out connection serves exactly one query before returning.
 struct DotPool {
     host: String,
     port: u16,
@@ -57,9 +51,8 @@ impl DotPool {
         }
     }
 
-    /// Returns a connection and whether it came from the idle pool (as
-    /// opposed to being freshly dialed), so callers can decide whether a
-    /// failure warrants a one-shot retry against a guaranteed-fresh connection.
+    /// Returns a connection plus whether it came from the idle pool (vs.
+    /// freshly dialed) — a reused one gets a one-shot retry on failure.
     async fn checkout(&self) -> Result<(TlsStream<TcpStream>, bool)> {
         if let Some(conn) = self.idle.lock().unwrap().pop() {
             return Ok((conn, true));
@@ -132,13 +125,9 @@ impl<T: Upstream + ?Sized> Upstream for Arc<T> {
 /// How `MultiUpstream` spreads a query across its configured upstreams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {
-    /// Try each upstream in order, falling back to the next on failure or
-    /// timeout. One request in flight at a time.
+    /// Try each upstream in order, falling back on failure or timeout.
     Sequential,
-    /// Fire the query at every upstream at once and use whichever answers
-    /// first. Lower worst-case latency and tolerant of any single upstream
-    /// having a bad moment, at the cost of every query hitting every
-    /// configured upstream.
+    /// Query every upstream at once, use whichever answers first.
     Race,
 }
 
@@ -151,10 +140,8 @@ impl From<UpstreamStrategy> for Strategy {
     }
 }
 
-/// An ordered list of configured upstream resolvers, queried according to
-/// `strategy`. Generic over `Upstream` so the selection logic itself
-/// (fallback ordering, race-first-wins) can be unit-tested against fake
-/// upstreams with no real network/TLS involved.
+/// Generic over `Upstream` so fallback/race selection logic can be tested
+/// against fakes with no real network/TLS involved.
 pub struct MultiUpstream<U> {
     upstreams: Vec<U>,
     strategy: Strategy,
@@ -165,9 +152,8 @@ impl<U: Upstream> MultiUpstream<U> {
         Self { upstreams, strategy }
     }
 
-    /// Forwards `query` per `strategy`. The outgoing query ID is randomized
-    /// per attempt (by each `Upstream` impl) and the caller's original ID is
-    /// restored on the returned message.
+    /// Each attempt randomizes its own outgoing query ID; the caller's
+    /// original ID is restored on the returned message.
     pub async fn resolve(&self, query: &Message) -> Result<Message> {
         let original_id = query.metadata.id;
         let mut response = match self.strategy {

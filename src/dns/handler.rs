@@ -111,13 +111,9 @@ async fn fetch_from_upstream<U: Upstream>(
     }
 }
 
-/// RFC 2308 negative caching: an NXDOMAIN, or a NOERROR with no answers
-/// (NODATA — the name exists but not for this qtype), is safe to cache when
-/// the upstream included the zone's SOA record in the authority section.
-/// The negative TTL is the smaller of the SOA record's own TTL and its
-/// MINIMUM field (RFC 2308 §3/§5) — that's the zone operator's stated bound
-/// on how long the absence may be assumed to hold. Without an SOA there's no
-/// such bound, so the response isn't cached at all rather than guessing one.
+/// RFC 2308 negative caching: NXDOMAIN or NODATA is cacheable only if the
+/// upstream's authority section has an SOA, using min(SOA TTL, SOA MINIMUM).
+/// No SOA means no bound on how long the absence holds, so don't cache it.
 fn negative_ttl(response: &Message) -> Option<u32> {
     let is_negative = response.metadata.response_code == ResponseCode::NXDomain
         || (response.metadata.response_code == ResponseCode::NoError && response.answers.is_empty());
@@ -147,10 +143,8 @@ fn base_response(request: &Message, question: &Query) -> Message {
     response
 }
 
-/// Answers directly from a configured static host entry. Only A is ever
-/// synthesized (no IPv6 support); any other qtype for a static name yields
-/// NOERROR/NODATA rather than being forwarded upstream, since overridden
-/// names are never meant to leak externally.
+/// Only A is synthesized (no IPv6); other qtypes get NOERROR/NODATA instead
+/// of being forwarded upstream — static names never leak externally.
 fn static_response(request: &Message, question: &Query, host: &StaticHost) -> Message {
     let mut response = base_response(request, question);
     if question.query_type == RecordType::A {

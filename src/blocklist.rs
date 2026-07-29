@@ -14,9 +14,8 @@ use crate::util::normalize_name;
 /// Lock-free-to-read, hot-swappable set of blocked domains (normalized, trailing-dot form).
 pub type BlockSet = Arc<ArcSwap<HashSet<String>>>;
 
-/// Hostnames that commonly appear in the preamble of hosts-format blocklists
-/// pointing at 0.0.0.0/127.0.0.1. These are infrastructure names, not ads/trackers,
-/// and must never be blocked or the resolver breaks local name resolution.
+/// Infrastructure hostnames that show up in hosts-format blocklist preambles
+/// (pointing at 0.0.0.0/127.0.0.1) but must never actually be blocked.
 const EXCLUDED_HOSTNAMES: &[&str] = &[
     "localhost.",
     "localhost.localdomain.",
@@ -40,9 +39,8 @@ struct Source {
 pub struct BlocklistManager {
     http: reqwest::Client,
     sources: Vec<Arc<Source>>,
-    /// Normalized names that must never end up in `merged`, even if a source
-    /// lists them — subtracted out every time `merged` is rebuilt, so a
-    /// background refresh can never bring a whitelisted domain back.
+    /// Subtracted from `merged` on every rebuild, so a refresh can't bring a
+    /// whitelisted domain back.
     whitelist: HashSet<String>,
     merged: BlockSet,
 }
@@ -82,15 +80,10 @@ impl BlocklistManager {
         self.merged.clone()
     }
 
-    /// Fetches every source concurrently and blocks until the initial merged
-    /// set is published, then spawns one background refresh loop per source.
-    /// A source that fails to fetch (initially or on refresh) just keeps its
-    /// previous contents (empty on first failure) rather than taking the
-    /// server down — blocklist availability should fail open, not crash DNS.
-    ///
-    /// `shutdown` stops the background refresh loops once cancelled, so a
-    /// config reload (which builds a brand-new `BlocklistManager`) doesn't
-    /// leak the old one's tasks running forever alongside the new one's.
+    /// Fetches every source concurrently, publishes the merged set, then
+    /// spawns a background refresh loop per source until `shutdown` fires.
+    /// A source that fails to fetch keeps its previous contents rather than
+    /// taking the server down.
     pub async fn start(self: &Arc<Self>, shutdown: CancellationToken) {
         let mut handles = Vec::with_capacity(self.sources.len());
         for src in &self.sources {
@@ -158,23 +151,12 @@ impl BlocklistManager {
     }
 }
 
-/// Parses a blocklist body. Supports:
-/// - hosts-format (`0.0.0.0 domain.tld [alias...]`)
-/// - plain domain-per-line
-/// - Adblock Plus network rules (`||domain^`, optionally with `$options`)
-///
-/// Adblock Plus *cosmetic* rules (`domain##selector`, `domain#@#selector`,
-/// `domain#?#selector`, ...) are deliberately never treated as a domain to
-/// block — they tell a browser extension to hide a page element, not block
-/// the domain at the network level. An earlier version of this parser
-/// treated `#` as starting a trailing comment, which silently truncated
-/// exactly these lines down to the bare domain — so every site with an
-/// EasyList/Fanboy cosmetic rule (i.e. most of the web, including things
-/// like google.com and github.com) got NXDOMAIN'd. Only a whole line
-/// starting with `#` is a comment now, and every extracted candidate is
-/// validated to actually look like a domain before being inserted, which is
-/// what makes a cosmetic-rule line a safe no-op instead of a corruption
-/// vector.
+/// Parses hosts-format, plain domain-per-line, and Adblock Plus network
+/// rules (`||domain^`). Adblock Plus *cosmetic* rules (`domain##selector`,
+/// `#@#`, `#?#`) hide a page element, not a domain, and are never treated as
+/// one — an earlier parser treated `#` as a trailing comment marker and
+/// truncated these down to a bare (and very much not blocked-worthy) domain,
+/// NXDOMAIN'ing half the web. Only a line starting with `#` is a comment now.
 pub fn parse_list(body: &str) -> HashSet<String> {
     let mut set = HashSet::new();
     for raw_line in body.lines() {
@@ -221,14 +203,10 @@ fn insert_if_valid(set: &mut HashSet<String>, domain: &str) {
     set.insert(normalized);
 }
 
-/// Extracts the domain from an Adblock Plus network rule of the form
-/// `||domain^`, optionally followed by nothing but a `$options` suffix.
-/// Rules with wildcards or paths in the domain part (`*`, `/`) are skipped
-/// rather than guessed at, and so is anything after the `^` that isn't a
-/// `$options` suffix — `||domain^*/path` matches a specific path, not the
-/// whole domain, so collapsing it down to "block domain" would over-block.
-/// Exception rules (`@@||domain^`) don't start with `||` so they never
-/// match here, which is what keeps them from being mistaken for a block.
+/// Extracts the domain from `||domain^` (optionally `||domain^$options`).
+/// Skips rules with a wildcard/path in the domain, or a path after `^` (e.g.
+/// `||domain^*/path`) — those match a specific path, not the whole domain.
+/// Exception rules (`@@||domain^`) don't start with `||` so never match here.
 fn adblock_network_rule_domain(line: &str) -> Option<&str> {
     let rest = line.strip_prefix("||")?;
     let end = rest.find('^')?;
@@ -243,15 +221,10 @@ fn adblock_network_rule_domain(line: &str) -> Option<&str> {
     Some(candidate)
 }
 
-/// A conservative sanity check, not a full RFC 1035 validator — just enough
-/// to reject anything that couldn't plausibly be a DNS name (filter-list
-/// syntax, stray HTML, etc.) rather than silently blocking it.
-///
-/// Requires an *interior* dot (i.e. still has one after stripping leading
-/// and trailing dots, matching what `normalize_name` does) — a bare CSS
-/// class selector like `.ytd-browse` contains a dot too, but it's only the
-/// leading one, and normalizing strips that down to a single-label
-/// "ytd-browse." that would otherwise pass right through.
+/// Not a full RFC 1035 validator, just enough to reject filter-list syntax
+/// and stray HTML. Requires an interior dot (after stripping leading/trailing
+/// ones) so a CSS selector like `.ytd-browse` — one leading dot, no interior
+/// one — doesn't pass through.
 fn looks_like_domain(s: &str) -> bool {
     let trimmed = s.trim_matches('.');
     !trimmed.is_empty()

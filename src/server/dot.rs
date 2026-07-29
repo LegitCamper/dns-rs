@@ -15,13 +15,10 @@ use crate::state::AppState;
 /// regardless of transport.
 const MAX_MESSAGE_SIZE: usize = 65535;
 
-/// RFC 7858 DNS-over-TLS listener: plain TCP + TLS, with each message framed
-/// by a 2-byte big-endian length prefix (the same framing classic DNS-over-TCP
-/// uses). A connection may carry multiple pipelined queries.
-///
-/// Stops accepting new connections and returns once `shutdown` is cancelled
-/// (used for config-reload restarts); already-accepted connections are left
-/// to finish on their own rather than being cut off.
+/// RFC 7858 DNS-over-TLS listener, 2-byte length-prefixed framing (same as
+/// classic DNS-over-TCP); a connection may carry multiple pipelined queries.
+/// Stops accepting new connections once `shutdown` fires; already-accepted
+/// ones finish on their own.
 pub async fn serve(
     addr: SocketAddr,
     tls_config: Arc<rustls::ServerConfig>,

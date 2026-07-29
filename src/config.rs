@@ -140,14 +140,10 @@ pub struct UpstreamsConfig {
 #[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UpstreamStrategy {
-    /// Try upstreams one at a time, in order, falling back to the next on
-    /// failure or timeout. One request in flight per query.
+    /// Try each upstream in order, falling back on failure or timeout.
     #[default]
     Sequential,
-    /// Query every configured upstream at once and use whichever answers
-    /// first — lower worst-case latency, and one upstream having a bad
-    /// moment doesn't cost you the query, at the price of every query
-    /// hitting every configured upstream.
+    /// Query every upstream at once, use whichever answers first.
     Race,
 }
 
@@ -164,11 +160,9 @@ pub enum UpstreamConfig {
 }
 
 impl UpstreamConfig {
-    /// Parses one `upstream` entry. `https://...` is DoH, used as-is.
-    /// `tls://host:port` is DoT; the TLS name (SNI / cert hostname) defaults
-    /// to `host`, or can be overridden with `tls://host:port#tls_name` for
-    /// the common case of connecting to a literal IP but validating against
-    /// a provider's real hostname (e.g. `tls://1.1.1.1:853#cloudflare-dns.com`).
+    /// `https://...` is DoH. `tls://host:port` is DoT; TLS name defaults to
+    /// `host`, or override with `tls://host:port#tls_name` (e.g. connecting
+    /// to a literal IP but validating against the provider's hostname).
     fn parse(entry: &str) -> Result<Self> {
         if entry.starts_with("https://") {
             return Ok(Self::Doh { url: entry.to_string() });
@@ -199,12 +193,8 @@ impl UpstreamConfig {
 pub struct CacheConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Total bytes reserved for cache storage, allocated once up front as a
-    /// single fixed-size pool that individual responses are dynamically
-    /// suballocated from (see `dns::cache`) — not a number to merely stay
-    /// under, and not divided into fixed-size slots, so a response only ever
-    /// uses as many bytes as it actually needs. Nothing about serving a
-    /// request grows, shrinks, or reallocates this pool.
+    /// Total bytes reserved for cache storage, allocated once as a single
+    /// pool that responses are suballocated from (see `dns::cache`).
     #[serde(default = "default_max_size_bytes")]
     pub max_size_bytes: u64,
 }

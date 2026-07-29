@@ -6,12 +6,8 @@ use hickory_proto::rr::{DNSClass, RecordType};
 use tokio::sync::OnceCell;
 
 /// Coalesces concurrent identical cache-miss queries into a single upstream
-/// fetch, so a burst of clients asking for the same currently-uncached name
-/// (e.g. right after it expires) doesn't turn into a burst of duplicate
-/// upstream queries. Whichever caller registers first ("the leader") runs
-/// `fetch`; everyone else concurrently asking for the same (name, qtype,
-/// qclass) just awaits the same result via `OnceCell`, which guarantees the
-/// initializer runs at most once regardless of how many callers race in.
+/// fetch. Whichever caller registers first runs `fetch`; the rest just await
+/// the same `OnceCell`, which guarantees it runs at most once.
 #[derive(Default)]
 pub struct InFlightRegistry {
     entries: Mutex<HashMap<(RecordType, DNSClass), HashMap<String, Arc<OnceCell<Vec<u8>>>>>>,
