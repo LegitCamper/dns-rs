@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
@@ -17,7 +18,7 @@ use crate::dns::upstream::{self, MultiUpstream, SingleUpstream, Upstream};
 pub struct AppState<U: Upstream = SingleUpstream> {
     pub static_hosts: HashMap<String, StaticHost>,
     pub blocklist: BlockSet,
-    pub cache: ResponseCache,
+    pub cache: Arc<ResponseCache>,
     pub in_flight: InFlightRegistry,
     pub upstreams: MultiUpstream<U>,
     pub block_mode: BlockMode,
@@ -27,19 +28,23 @@ pub struct AppState<U: Upstream = SingleUpstream> {
 
 impl AppState<SingleUpstream> {
     /// Builds shared state from config and kicks off the blocklist manager's
-    /// initial fetch + background refresh loops. `shutdown` stops those
-    /// background loops when cancelled — the caller cancels it when this
-    /// state is being replaced by a config reload.
+    /// initial fetch + background refresh loops, plus the cache's background
+    /// TTL sweeper. `shutdown` stops those background loops when cancelled —
+    /// the caller cancels it when this state is being replaced by a config
+    /// reload.
     pub async fn build(config: &Config, shutdown: CancellationToken) -> Result<Self> {
-        let blocklist_manager = std::sync::Arc::new(BlocklistManager::new(&config.blocklists, &config.whitelist));
-        blocklist_manager.start(shutdown).await;
+        let blocklist_manager = Arc::new(BlocklistManager::new(&config.blocklists, &config.whitelist));
+        blocklist_manager.start(shutdown.clone()).await;
+
+        let cache = Arc::new(ResponseCache::new(config.cache.enabled, config.cache.max_size_bytes));
+        cache.start_ttl_sweeper(shutdown);
 
         let upstream_configs = config.parsed_upstreams()?;
 
         Ok(Self {
             static_hosts: config.static_hosts_map(),
             blocklist: blocklist_manager.merged_set(),
-            cache: ResponseCache::new(config.cache.enabled, config.cache.max_entries),
+            cache,
             in_flight: InFlightRegistry::new(),
             upstreams: upstream::build(&upstream_configs, config.upstream.strategy)?,
             block_mode: config.blocking.mode,

@@ -88,12 +88,19 @@ async fn fetch_from_upstream<U: Upstream>(
     match state.upstreams.resolve(request).await {
         Ok(response) => {
             let wire = encode_or_servfail(&response, id, op_code);
-            match response.answers.iter().map(|r| r.ttl).min() {
-                Some(ttl) if ttl > 0 => {
+            let ttl = response
+                .answers
+                .iter()
+                .map(|r| r.ttl)
+                .min()
+                .or_else(|| negative_ttl(&response))
+                .filter(|&ttl| ttl > 0);
+            match ttl {
+                Some(ttl) => {
                     debug!(%qname, ?qtype, ttl, "caching upstream response");
                     state.cache.insert(qname, qtype, qclass, ttl, wire.clone());
                 }
-                _ => debug!(%qname, ?qtype, "not caching (no TTL-bearing answers)"),
+                None => debug!(%qname, ?qtype, "not caching (no TTL-bearing answers, and no SOA to bound a negative cache)"),
             }
             wire
         }
@@ -102,6 +109,25 @@ async fn fetch_from_upstream<U: Upstream>(
             encode_or_servfail(&Message::error_msg(id, op_code, ResponseCode::ServFail), id, op_code)
         }
     }
+}
+
+/// RFC 2308 negative caching: an NXDOMAIN, or a NOERROR with no answers
+/// (NODATA — the name exists but not for this qtype), is safe to cache when
+/// the upstream included the zone's SOA record in the authority section.
+/// The negative TTL is the smaller of the SOA record's own TTL and its
+/// MINIMUM field (RFC 2308 §3/§5) — that's the zone operator's stated bound
+/// on how long the absence may be assumed to hold. Without an SOA there's no
+/// such bound, so the response isn't cached at all rather than guessing one.
+fn negative_ttl(response: &Message) -> Option<u32> {
+    let is_negative = response.metadata.response_code == ResponseCode::NXDomain
+        || (response.metadata.response_code == ResponseCode::NoError && response.answers.is_empty());
+    if !is_negative {
+        return None;
+    }
+    response.authorities.iter().find_map(|record| match &record.data {
+        RData::SOA(soa) => Some(record.ttl.min(soa.minimum)),
+        _ => None,
+    })
 }
 
 fn encode_or_servfail(message: &Message, request_id: u16, op_code: OpCode) -> Vec<u8> {
@@ -177,7 +203,7 @@ mod tests {
         AppState {
             static_hosts: HashMap::new(),
             blocklist: Arc::new(ArcSwap::from_pointee(HashSet::new())),
-            cache: ResponseCache::new(true, 1000),
+            cache: Arc::new(ResponseCache::new(true, 65536)),
             in_flight: InFlightRegistry::new(),
             upstreams: MultiUpstream::new(upstreams, strategy),
             block_mode: BlockMode::Nxdomain,
@@ -314,5 +340,92 @@ mod tests {
             assert_eq!(resp.metadata.id, 100 + i as u16);
         }
         assert_eq!(upstream.calls(), 1, "20 concurrent identical queries should coalesce into 1 upstream call");
+    }
+
+    #[tokio::test]
+    async fn nxdomain_with_soa_is_negative_cached() {
+        let upstream = Arc::new(TestUpstream::nxdomain_with_soa("auth", 3600, 60));
+        let state = build_state(vec![Arc::clone(&upstream)], Strategy::Sequential);
+
+        let first = decode(&handle_query(&state, &wire_query("missing.example.com", RecordType::A, 40)).await);
+        assert_eq!(first.metadata.response_code, ResponseCode::NXDomain);
+        assert_eq!(upstream.calls(), 1);
+
+        let second = decode(&handle_query(&state, &wire_query("missing.example.com", RecordType::A, 41)).await);
+        assert_eq!(second.metadata.response_code, ResponseCode::NXDomain);
+        assert_eq!(second.metadata.id, 41, "cache hit must carry the new request's ID");
+        assert_eq!(upstream.calls(), 1, "second identical query should be served from the negative cache");
+    }
+
+    #[tokio::test]
+    async fn nodata_with_soa_is_negative_cached() {
+        let upstream = Arc::new(TestUpstream::nodata_with_soa("auth", 3600, 60));
+        let state = build_state(vec![Arc::clone(&upstream)], Strategy::Sequential);
+
+        let first = decode(&handle_query(&state, &wire_query("exists.example.com", RecordType::TXT, 50)).await);
+        assert_eq!(first.metadata.response_code, ResponseCode::NoError);
+        assert!(first.answers.is_empty());
+        assert_eq!(upstream.calls(), 1);
+
+        let second = decode(&handle_query(&state, &wire_query("exists.example.com", RecordType::TXT, 51)).await);
+        assert_eq!(second.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(upstream.calls(), 1, "second identical NODATA query should be served from the negative cache");
+    }
+
+    #[tokio::test]
+    async fn nxdomain_without_soa_is_never_cached() {
+        let upstream = Arc::new(TestUpstream::nxdomain("auth"));
+        let state = build_state(vec![Arc::clone(&upstream)], Strategy::Sequential);
+
+        decode(&handle_query(&state, &wire_query("missing.example.org", RecordType::A, 60)).await);
+        decode(&handle_query(&state, &wire_query("missing.example.org", RecordType::A, 61)).await);
+
+        assert_eq!(
+            upstream.calls(),
+            2,
+            "without an SOA there's no bound on the negative TTL, so it must never be cached"
+        );
+    }
+
+    #[test]
+    fn negative_ttl_uses_the_smaller_of_soa_ttl_and_minimum() {
+        let mut response = Message::response(1, OpCode::Query);
+        response.metadata.response_code = ResponseCode::NXDomain;
+        response.add_authority(Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            3600,
+            RData::SOA(hickory_proto::rr::rdata::SOA::new(
+                Name::from_ascii("ns1.example.com.").unwrap(),
+                Name::from_ascii("hostmaster.example.com.").unwrap(),
+                1,
+                3600,
+                600,
+                86400,
+                60,
+            )),
+        ));
+
+        assert_eq!(negative_ttl(&response), Some(60), "MINIMUM (60) is smaller than the SOA record's own TTL (3600)");
+    }
+
+    #[test]
+    fn negative_ttl_is_none_without_an_soa_record() {
+        let mut response = Message::response(1, OpCode::Query);
+        response.metadata.response_code = ResponseCode::NXDomain;
+
+        assert_eq!(negative_ttl(&response), None);
+    }
+
+    #[test]
+    fn negative_ttl_is_none_for_a_positive_response() {
+        let mut response = Message::response(1, OpCode::Query);
+        response.metadata.response_code = ResponseCode::NoError;
+        response.add_answer(Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            60,
+            RData::A(A::from(Ipv4Addr::new(1, 2, 3, 4))),
+        ));
+
+        assert_eq!(negative_ttl(&response), None);
     }
 }

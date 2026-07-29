@@ -67,4 +67,10 @@ urls = [
 
 [cache]
 enabled = true
-max_entries = 10000
+# The whole cache is a single fixed-size pool allocated once at startup;
+# individual responses are dynamically suballocated from it (each using only
+# as many bytes as it actually needs, not a fixed slot sized for the worst
+# case). Nothing about serving a request grows, shrinks, or reallocates this
+# pool. If it fills up, expired entries are evicted first, then
+# least-recently-used ones, until the next response fits.
+max_size_bytes = 67108864  # 64 MiB

@@ -199,15 +199,21 @@ impl UpstreamConfig {
 pub struct CacheConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    #[serde(default = "default_max_entries")]
-    pub max_entries: usize,
+    /// Total bytes reserved for cache storage, allocated once up front as a
+    /// single fixed-size pool that individual responses are dynamically
+    /// suballocated from (see `dns::cache`) — not a number to merely stay
+    /// under, and not divided into fixed-size slots, so a response only ever
+    /// uses as many bytes as it actually needs. Nothing about serving a
+    /// request grows, shrinks, or reallocates this pool.
+    #[serde(default = "default_max_size_bytes")]
+    pub max_size_bytes: u64,
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             enabled: default_true(),
-            max_entries: default_max_entries(),
+            max_size_bytes: default_max_size_bytes(),
         }
     }
 }
@@ -216,8 +222,8 @@ fn default_true() -> bool {
     true
 }
 
-fn default_max_entries() -> usize {
-    10_000
+fn default_max_size_bytes() -> u64 {
+    64 * 1024 * 1024 // 64 MiB
 }
 
 #[derive(Debug, Clone, Copy)]
