@@ -25,12 +25,20 @@ refresh_interval_secs = 43200  # applies to every URL below
 urls = [
   "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
 ]
+# Literal domains to always block, in addition to whatever the URLs above
+# resolve to. Checked as exact names (not by subdomain).
+domains = [
+  # "ads.example.com",
+]
 
 [whitelist]
-# Unlike [blocklists] above, this is NOT a list of URLs to fetch - just plain
-# domain names that must never be blocked, even if a source in [blocklists]
-# lists them. Checked as exact names, same as the blocklist itself (not by
-# subdomain).
+# Same shape as [blocklists] above: domains that must never be blocked, even
+# if a source in [blocklists] lists them - checked as exact names (not by
+# subdomain). Either urls, domains, or both may be used.
+refresh_interval_secs = 43200  # applies to every URL below
+urls = [
+  # "https://example.com/known-good-domains.txt",
+]
 domains = [
   # "s.youtube.com",
 ]

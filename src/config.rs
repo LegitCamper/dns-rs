@@ -97,11 +97,18 @@ fn default_sinkhole_ip() -> Ipv4Addr {
     Ipv4Addr::UNSPECIFIED
 }
 
+/// Domains to block: `urls` are fetched (hosts-format, plain domain list, or
+/// Adblock-style network rules — see `blocklist::parse_list`) and refreshed
+/// every `refresh_interval_secs`; `domains` are literal names, always
+/// applied in addition to whatever the URLs resolve to. Either or both may
+/// be used.
 #[derive(Debug, Deserialize)]
 pub struct BlocklistsConfig {
     #[serde(default)]
     pub urls: Vec<String>,
-    #[serde(default = "default_blocklist_refresh_secs")]
+    #[serde(default)]
+    pub domains: Vec<String>,
+    #[serde(default = "default_list_refresh_secs")]
     pub refresh_interval_secs: u64,
 }
 
@@ -109,22 +116,38 @@ impl Default for BlocklistsConfig {
     fn default() -> Self {
         Self {
             urls: Vec::new(),
-            refresh_interval_secs: default_blocklist_refresh_secs(),
+            domains: Vec::new(),
+            refresh_interval_secs: default_list_refresh_secs(),
         }
     }
 }
 
-fn default_blocklist_refresh_secs() -> u64 {
+fn default_list_refresh_secs() -> u64 {
     43_200 // 12h
 }
 
-/// Unlike `[blocklists]`, this isn't a list of URLs to fetch — just literal
-/// domain names that must never be blocked, even if a source in
-/// `[blocklists]` lists them. Checked as exact names, not by subdomain.
-#[derive(Debug, Default, Deserialize)]
+/// Domains that must never be blocked, even if a source in `[blocklists]`
+/// lists them - checked as exact names, not by subdomain. Same shape as
+/// `[blocklists]`: `urls` are fetched and refreshed on their own schedule,
+/// `domains` are literal names always applied in addition.
+#[derive(Debug, Deserialize)]
 pub struct WhitelistConfig {
     #[serde(default)]
+    pub urls: Vec<String>,
+    #[serde(default)]
     pub domains: Vec<String>,
+    #[serde(default = "default_list_refresh_secs")]
+    pub refresh_interval_secs: u64,
+}
+
+impl Default for WhitelistConfig {
+    fn default() -> Self {
+        Self {
+            urls: Vec::new(),
+            domains: Vec::new(),
+            refresh_interval_secs: default_list_refresh_secs(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -254,6 +277,9 @@ impl Config {
         }
         if !self.blocklists.urls.is_empty() && self.blocklists.refresh_interval_secs == 0 {
             bail!("blocklists.refresh_interval_secs must not be 0");
+        }
+        if !self.whitelist.urls.is_empty() && self.whitelist.refresh_interval_secs == 0 {
+            bail!("whitelist.refresh_interval_secs must not be 0");
         }
         Ok(())
     }

@@ -187,7 +187,9 @@ def render_config(
     cache_max_bytes: int = 64 * 1024 * 1024,
     cache_enabled: bool = True,
     blocklist_urls: list[str] | None = None,
+    blocklist_domains: list[str] | None = None,
     whitelist: list[str] | None = None,
+    whitelist_urls: list[str] | None = None,
     static_hosts: dict[str, str] | None = None,
     block_mode: str = "nxdomain",
 ) -> str:
@@ -212,8 +214,11 @@ sinkhole_ip = "0.0.0.0"
 [blocklists]
 refresh_interval_secs = 43200
 urls = {toml_list(blocklist_urls or [])}
+domains = {toml_list(blocklist_domains or [])}
 
 [whitelist]
+refresh_interval_secs = 43200
+urls = {toml_list(whitelist_urls or [])}
 domains = {toml_list(whitelist or [])}
 
 [upstream]
@@ -449,6 +454,41 @@ async def scenario_smoke() -> bool:
             )
     finally:
         blocklist_server.stop()
+
+    # Whitelist URLs (not just inline whitelist domains) must override the
+    # blocklist, on equal footing with a blocklist URL. Sinkhole mode gives
+    # a blocked domain a distinct NOERROR+sinkhole-IP answer instead of
+    # NXDOMAIN, so "blocked" and "whitelisted-and-forwarded-to-a-real-
+    # upstream-that-says-NXDOMAIN-because-.invalid-doesn't-exist" are
+    # actually distinguishable outcomes.
+    block_server = LocalHttpTextServer(b"0.0.0.0 blocked-only.test.invalid\n0.0.0.0 blocked-and-allowed.test.invalid\n")
+    allow_server = LocalHttpTextServer(b"blocked-and-allowed.test.invalid\n")
+    try:
+        wl_dot_port, wl_doh_port = free_port(), free_port()
+        wl_config = render_config(
+            dot_port=wl_dot_port,
+            doh_port=wl_doh_port,
+            upstream_urls=[REAL_UPSTREAM_DOH],
+            blocklist_urls=[block_server.url()],
+            whitelist_urls=[allow_server.url()],
+            block_mode="sinkhole",
+        )
+        with DnsRsServer("smoke-whitelist-url", wl_config):
+            resp = await dot_query(wl_dot_port, make_query("blocked-only.test.invalid", "A"))
+            ok &= check(
+                "a domain in the blocklist only is sinkholed",
+                resp.rcode() == dns.rcode.NOERROR and str(resp.answer[0][0]) == "0.0.0.0",
+            )
+
+            resp = await dot_query(wl_dot_port, make_query("blocked-and-allowed.test.invalid", "A"))
+            ok &= check(
+                "a whitelist URL (not just inline whitelist domains) overrides the blocklist",
+                resp.rcode() == dns.rcode.NXDOMAIN,
+                detail="expected the query to be forwarded upstream (real NXDOMAIN for a .invalid name), not sinkholed",
+            )
+    finally:
+        block_server.stop()
+        allow_server.stop()
 
     # Concurrency proof: a slow pipelined miss must not block a faster
     # pipelined query behind it. Upstream is a "blackhole" that never
