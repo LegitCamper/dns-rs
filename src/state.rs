@@ -1,8 +1,8 @@
-use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use anyhow::Result;
+use rustc_hash::FxHashMap;
 use tokio_util::sync::CancellationToken;
 
 use crate::blocklist::{BlockSet, BlocklistManager};
@@ -15,7 +15,10 @@ use crate::dns::upstream::{self, MultiUpstream, SingleUpstream, Upstream};
 /// Generic over `Upstream` so tests can substitute a fake with no real
 /// network/TLS involved; production uses the default, `SingleUpstream`.
 pub struct AppState<U: Upstream = SingleUpstream> {
-    pub static_hosts: HashMap<String, StaticHost>,
+    /// Checked on every query, so this uses the same fast non-cryptographic
+    /// hasher as `BlockSet` and the response cache (see the tradeoff note
+    /// on `blocklist::BlockSet`).
+    pub static_hosts: FxHashMap<String, StaticHost>,
     pub blocklist: BlockSet,
     pub cache: Arc<ResponseCache>,
     pub in_flight: InFlightRegistry,

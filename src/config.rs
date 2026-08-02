@@ -262,7 +262,7 @@ impl Config {
         self.upstream.urls.iter().map(|s| UpstreamConfig::parse(s)).collect()
     }
 
-    pub fn static_hosts_map(&self) -> HashMap<String, StaticHost> {
+    pub fn static_hosts_map(&self) -> rustc_hash::FxHashMap<String, StaticHost> {
         self.static_hosts
             .iter()
             .map(|(domain, ip)| {

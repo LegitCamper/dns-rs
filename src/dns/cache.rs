@@ -1,63 +1,21 @@
 use std::alloc::Layout;
-use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hickory_proto::rr::{DNSClass, RecordType};
 use linked_list_allocator::Heap;
+use rustc_hash::FxHashMap;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
+
+use super::inline_name::InlineName;
 
 /// How often the background sweeper evicts expired entries.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
-/// RFC 1035 wire-format name length limit; names are stored inline
-/// (fixed-size array) so a lookup never has to allocate a `String`.
-const MAX_NAME_LEN: usize = 255;
-
 /// Below this, `linked_list_allocator` can't even fit its own bookkeeping.
 const MIN_POOL_BYTES: u64 = 64;
-
-#[derive(Clone, Copy)]
-struct InlineName {
-    len: u8,
-    bytes: [u8; MAX_NAME_LEN],
-}
-
-impl InlineName {
-    fn new(name: &str) -> Option<Self> {
-        if name.len() > MAX_NAME_LEN {
-            return None;
-        }
-        let mut bytes = [0u8; MAX_NAME_LEN];
-        bytes[..name.len()].copy_from_slice(name.as_bytes());
-        Some(Self { len: name.len() as u8, bytes })
-    }
-
-    fn as_bytes(&self) -> &[u8] {
-        &self.bytes[..self.len as usize]
-    }
-
-    /// For logging only; never relied on for correctness.
-    fn as_str(&self) -> &str {
-        std::str::from_utf8(self.as_bytes()).unwrap_or("<invalid-utf8>")
-    }
-}
-
-impl PartialEq for InlineName {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_bytes() == other.as_bytes()
-    }
-}
-
-impl Eq for InlineName {}
-
-impl std::hash::Hash for InlineName {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.as_bytes().hash(state);
-    }
-}
 
 type CacheKey = (RecordType, DNSClass, InlineName);
 
@@ -76,10 +34,9 @@ struct EntryMeta {
 /// qclass, qname). Storage is one preallocated arena (`max_size_bytes`,
 /// allocated once and never resized); responses are suballocated from it via
 /// `linked_list_allocator`, so each one uses only the bytes it needs. When
-/// full, `insert` evicts expired entries first, then LRU, until the new
-/// response fits (or gives up if it never will). `start_ttl_sweeper` also
-/// reclaims expired entries in the background so `insert` usually doesn't
-/// have to.
+/// full, `insert` evicts the least-recently-used entry until the new
+/// response fits (or gives up if it never will). `start_ttl_sweeper`
+/// reclaims expired entries in the background independently of that.
 pub struct ResponseCache {
     enabled: bool,
     state: Mutex<CacheState>,
@@ -88,7 +45,9 @@ pub struct ResponseCache {
 struct CacheState {
     pool: Box<[u8]>,
     heap: Heap,
-    entries: HashMap<CacheKey, EntryMeta>,
+    // Checked/updated on every request, so this uses the same fast
+    // non-cryptographic hasher as `BlockSet` (see the tradeoff note there).
+    entries: FxHashMap<CacheKey, EntryMeta>,
     lru_head: Option<CacheKey>,
     lru_tail: Option<CacheKey>,
 }
@@ -111,7 +70,7 @@ impl ResponseCache {
             state: Mutex::new(CacheState {
                 pool,
                 heap,
-                entries: HashMap::new(),
+                entries: FxHashMap::default(),
                 lru_head: None,
                 lru_tail: None,
             }),
@@ -286,12 +245,19 @@ impl CacheState {
         }
     }
 
-    /// Evicts an expired entry if one exists, else the LRU entry. Returns
-    /// false if the cache is empty.
+    /// Evicts the least-recently-used entry to make room. Returns false if
+    /// the cache is empty.
+    ///
+    /// This used to scan every entry first looking for an already-expired
+    /// one to reclaim instead of evicting a still-live LRU entry - a nicer
+    /// eviction choice, but an O(n) scan on every insert into a full cache,
+    /// which is precisely the hot path under sustained churn. The
+    /// background TTL sweeper (`evict_expired`, every `SWEEP_INTERVAL`)
+    /// already reclaims expired entries independently, so this doesn't
+    /// leave expired garbage stuck forever - it just isn't preferred over
+    /// the O(1) LRU-tail choice on the insert path anymore.
     fn evict_one_for_space(&mut self) -> bool {
-        let now = Instant::now();
-        let victim = self.entries.iter().find(|(_, m)| m.expires_at <= now).map(|(k, _)| *k).or(self.lru_tail);
-        let Some(victim) = victim else {
+        let Some(victim) = self.lru_tail else {
             return false;
         };
         debug!(name = %victim.2.as_str(), record_type = ?victim.0, "evicted a cache entry to make room");

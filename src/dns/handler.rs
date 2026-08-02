@@ -180,7 +180,6 @@ fn blocked_response<U: Upstream>(state: &AppState<U>, request: &Message, questio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{HashMap, HashSet};
     use std::net::Ipv4Addr;
     use std::sync::Arc;
     use std::time::Duration;
@@ -195,8 +194,8 @@ mod tests {
 
     fn build_state<U: Upstream>(upstreams: Vec<U>, strategy: Strategy) -> AppState<U> {
         AppState {
-            static_hosts: HashMap::new(),
-            blocklist: Arc::new(ArcSwap::from_pointee(HashSet::new())),
+            static_hosts: rustc_hash::FxHashMap::default(),
+            blocklist: Arc::new(ArcSwap::from_pointee(rustc_hash::FxHashSet::default())),
             cache: Arc::new(ResponseCache::new(true, 65536)),
             in_flight: InFlightRegistry::new(),
             upstreams: MultiUpstream::new(upstreams, strategy),
@@ -249,7 +248,7 @@ mod tests {
     async fn blocklist_nxdomain_mode_blocks_without_touching_upstream() {
         let never = Arc::new(TestUpstream::answering("never", "9.9.9.9".parse().unwrap()));
         let mut state = build_state(vec![Arc::clone(&never)], Strategy::Sequential);
-        state.blocklist = Arc::new(ArcSwap::from_pointee(HashSet::from(["ads.example.com.".to_string()])));
+        state.blocklist = Arc::new(ArcSwap::from_pointee(["ads.example.com.".to_string()].into_iter().collect()));
         state.block_mode = BlockMode::Nxdomain;
 
         let response = decode(&handle_query(&state, &wire_query("ads.example.com", RecordType::A, 2)).await);
@@ -263,7 +262,7 @@ mod tests {
     async fn blocklist_sinkhole_mode_returns_configured_ip() {
         let never = Arc::new(TestUpstream::answering("never", "9.9.9.9".parse().unwrap()));
         let mut state = build_state(vec![Arc::clone(&never)], Strategy::Sequential);
-        state.blocklist = Arc::new(ArcSwap::from_pointee(HashSet::from(["ads.example.com.".to_string()])));
+        state.blocklist = Arc::new(ArcSwap::from_pointee(["ads.example.com.".to_string()].into_iter().collect()));
         state.block_mode = BlockMode::Sinkhole;
         state.sinkhole_ip = "0.0.0.0".parse().unwrap();
 

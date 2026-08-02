@@ -1,18 +1,25 @@
-use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
 use arc_swap::ArcSwap;
+use rustc_hash::FxHashSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::config::{BlocklistsConfig, WhitelistConfig};
 use crate::util::normalize_name;
 
-/// Lock-free-to-read, hot-swappable set of blocked domains (normalized, trailing-dot form).
-pub type BlockSet = Arc<ArcSwap<HashSet<String>>>;
+/// Lock-free-to-read, hot-swappable set of blocked domains (normalized,
+/// trailing-dot form). Checked on essentially every query that isn't a
+/// cache hit or static host, so it uses a non-cryptographic hasher
+/// (`rustc-hash`, same as the response cache) for speed. Trade-off: a
+/// client that can choose which domain names it queries could in theory
+/// engineer hash collisions to degrade this set's performance - a low-risk
+/// concern for a personal/home resolver, but a real one if this is ever
+/// exposed to less-trusted clients.
+pub type BlockSet = Arc<ArcSwap<FxHashSet<String>>>;
 
 /// Infrastructure hostnames that show up in hosts-format blocklist preambles
 /// (pointing at 0.0.0.0/127.0.0.1) but must never actually be blocked.
@@ -33,7 +40,7 @@ const EXCLUDED_HOSTNAMES: &[&str] = &[
 struct Source {
     url: String,
     refresh_interval: Duration,
-    set: Mutex<Arc<HashSet<String>>>,
+    set: Mutex<Arc<FxHashSet<String>>>,
 }
 
 pub struct BlocklistManager {
@@ -41,7 +48,7 @@ pub struct BlocklistManager {
     sources: Vec<Arc<Source>>,
     /// Subtracted from `merged` on every rebuild, so a refresh can't bring a
     /// whitelisted domain back.
-    whitelist: HashSet<String>,
+    whitelist: FxHashSet<String>,
     merged: BlockSet,
 }
 
@@ -61,7 +68,7 @@ impl BlocklistManager {
                 Arc::new(Source {
                     url: url.clone(),
                     refresh_interval,
-                    set: Mutex::new(Arc::new(HashSet::new())),
+                    set: Mutex::new(Arc::new(FxHashSet::default())),
                 })
             })
             .collect();
@@ -72,7 +79,7 @@ impl BlocklistManager {
             http,
             sources,
             whitelist,
-            merged: Arc::new(ArcSwap::from_pointee(HashSet::new())),
+            merged: Arc::new(ArcSwap::from_pointee(FxHashSet::default())),
         }
     }
 
@@ -132,14 +139,14 @@ impl BlocklistManager {
         }
     }
 
-    async fn fetch_one(&self, url: &str) -> Result<HashSet<String>> {
+    async fn fetch_one(&self, url: &str) -> Result<FxHashSet<String>> {
         let resp = self.http.get(url).send().await?.error_for_status()?;
         let body = resp.text().await?;
         Ok(parse_list(&body))
     }
 
     fn republish_merged(&self) {
-        let mut merged = HashSet::new();
+        let mut merged = FxHashSet::default();
         for src in &self.sources {
             let snapshot = src.set.lock().unwrap().clone();
             merged.extend(snapshot.iter().cloned());
@@ -157,8 +164,8 @@ impl BlocklistManager {
 /// one — an earlier parser treated `#` as a trailing comment marker and
 /// truncated these down to a bare (and very much not blocked-worthy) domain,
 /// NXDOMAIN'ing half the web. Only a line starting with `#` is a comment now.
-pub fn parse_list(body: &str) -> HashSet<String> {
-    let mut set = HashSet::new();
+pub fn parse_list(body: &str) -> FxHashSet<String> {
+    let mut set = FxHashSet::default();
     for raw_line in body.lines() {
         let line = raw_line.trim();
         // `#` for hosts-format comments, `!` for Adblock Plus comments.
@@ -192,7 +199,7 @@ pub fn parse_list(body: &str) -> HashSet<String> {
     set
 }
 
-fn insert_if_valid(set: &mut HashSet<String>, domain: &str) {
+fn insert_if_valid(set: &mut FxHashSet<String>, domain: &str) {
     if !looks_like_domain(domain) {
         return;
     }
@@ -250,7 +257,7 @@ mod tests {
         // Simulate a source fetch landing entries directly, then re-derive
         // the merged set the same way a background refresh would.
         *manager.sources[0].set.lock().unwrap() =
-            Arc::new(HashSet::from(["ads.example.com.".to_string(), "s.youtube.com.".to_string()]));
+            Arc::new(["ads.example.com.".to_string(), "s.youtube.com.".to_string()].into_iter().collect());
         manager.republish_merged();
 
         let merged = manager.merged_set();
