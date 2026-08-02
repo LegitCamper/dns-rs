@@ -2,3 +2,5 @@
 /config.toml
 /cert.pem
 /key.pem
+/tests/e2e/certs/
+/tests/e2e/.run/

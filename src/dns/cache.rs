@@ -433,4 +433,65 @@ mod tests {
         }
         assert!(cache.get("live.", A, IN).is_some(), "unexpired entry must survive the sweep");
     }
+
+    /// High-churn stress test: many worker tasks hammering a small, always-
+    /// full pool with randomly-sized inserts, gets, and TTL expiry, all
+    /// racing the LRU eviction path and each other. This is the scenario
+    /// that would surface `linked_list_allocator` corruption or a broken LRU
+    /// invariant under sustained production load (many unique names cycling
+    /// through a bounded cache) that the smaller deterministic tests above
+    /// can't exercise.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn high_churn_concurrent_insert_get_evict_does_not_corrupt_the_pool() {
+        const POOL_BYTES: u64 = 64 * 1024;
+        const WORKERS: usize = 8;
+        const OPS_PER_WORKER: usize = 5_000;
+
+        let cache = Arc::new(ResponseCache::new(true, POOL_BYTES));
+        let mut handles = Vec::with_capacity(WORKERS);
+        for _ in 0..WORKERS {
+            let cache = Arc::clone(&cache);
+            handles.push(tokio::spawn(async move {
+                for i in 0..OPS_PER_WORKER {
+                    // A bounded pool of names so gets/reinserts of the same
+                    // key (not just fresh misses) get exercised too.
+                    let name = format!("churn-{}.example.", rand::random::<u16>() % 200);
+                    let size = 8 + (rand::random::<u16>() % 512) as usize;
+                    let ttl = 1 + rand::random::<u32>() % 5; // short TTLs so expiry races eviction
+                    cache.insert(name.clone(), A, IN, ttl, vec![(i % 256) as u8; size]);
+                    let _ = cache.get(&name, A, IN);
+                    if i % 137 == 0 {
+                        cache.evict_expired();
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.await.expect("worker task panicked");
+        }
+
+        cache.evict_expired();
+        let state = cache.state.lock().unwrap();
+        assert_eq!(state.pool.len(), POOL_BYTES as usize, "the preallocated pool must never grow or move");
+
+        // Walk the LRU list and confirm it's still a simple acyclic chain
+        // that reaches exactly the entries HashMap holds - the invariant
+        // that would break first if concurrent eviction corrupted a link.
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor = state.lru_head;
+        while let Some(key) = cursor {
+            assert!(seen.insert(key), "LRU list must not contain a cycle");
+            cursor = state.entries.get(&key).expect("LRU list must only reference live entries").next;
+        }
+        assert_eq!(seen.len(), state.entries.len(), "LRU list must reach every live entry exactly once");
+
+        if state.entries.is_empty() {
+            assert!(state.lru_head.is_none() && state.lru_tail.is_none());
+        } else {
+            let head = state.lru_head.expect("non-empty cache must have a head");
+            let tail = state.lru_tail.expect("non-empty cache must have a tail");
+            assert!(state.entries.get(&head).unwrap().prev.is_none(), "head must have no prev");
+            assert!(state.entries.get(&tail).unwrap().next.is_none(), "tail must have no next");
+        }
+    }
 }

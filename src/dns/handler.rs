@@ -105,7 +105,7 @@ async fn fetch_from_upstream<U: Upstream>(
             wire
         }
         Err(err) => {
-            warn!(error = %err, qname = %qname, "upstream resolution failed");
+            warn!(error = format!("{err:#}"), qname = %qname, "upstream resolution failed");
             encode_or_servfail(&Message::error_msg(id, op_code, ResponseCode::ServFail), id, op_code)
         }
     }

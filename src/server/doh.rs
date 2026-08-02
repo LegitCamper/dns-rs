@@ -22,6 +22,21 @@ use tracing::info;
 /// client but still gives well-behaved ones a chance to complete.
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// hyper's HTTP/2 "rapid reset" mitigation (RUSTSEC-2024-0003) tears down the
+/// whole connection once a client has RST_STREAM'd more than this many
+/// requests without the server finishing them first. h2's own default (20)
+/// is sized for detecting a deliberate flood, not for a legitimate client
+/// under load bailing on a batch of slow-resolving queries — hitting it just
+/// converts a handful of individually-slow queries into every other
+/// in-flight query on that connection failing too. Raised, not disabled, so
+/// real abuse is still caught.
+const MAX_PENDING_RESET_STREAMS: usize = 200;
+/// SETTINGS_MAX_CONCURRENT_STREAMS: h2's default of 200 throttles new stream
+/// creation once a single connection has that many DoH queries in flight,
+/// which a concurrent test client (or a busy resolver) reaches easily and
+/// then queues/times out waiting for a slot.
+const MAX_CONCURRENT_STREAMS: u32 = 1000;
+
 use crate::dns::handler::handle_query;
 use crate::state::AppState;
 
@@ -62,8 +77,15 @@ pub async fn serve(
         }
     });
 
+    let mut server = axum_server::bind_rustls(addr, tls_config);
+    server
+        .http_builder()
+        .http2()
+        .max_pending_accept_reset_streams(Some(MAX_PENDING_RESET_STREAMS))
+        .max_concurrent_streams(Some(MAX_CONCURRENT_STREAMS));
+
     info!(%addr, "DoH listener ready");
-    axum_server::bind_rustls(addr, tls_config)
+    server
         .handle(handle)
         .serve(app.into_make_service())
         .await
