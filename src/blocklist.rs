@@ -37,18 +37,64 @@ const EXCLUDED_HOSTNAMES: &[&str] = &[
     "ip6-allhosts.",
 ];
 
+/// One fetchable domain-list URL, refreshed independently on its own timer.
 struct Source {
     url: String,
     refresh_interval: Duration,
     set: Mutex<Arc<FxHashSet<String>>>,
 }
 
+/// One direction's worth of domains - either the blocklist or the
+/// whitelist, both of which have the identical shape: a fixed set of
+/// inline domains from config, plus zero or more URL sources each fetched
+/// and refreshed on their own schedule. `raw` is the union of all of them
+/// for this direction alone; `BlocklistManager` combines both directions'
+/// `raw` sets (block minus allow) into the actually-published `BlockSet`.
+struct DomainSet {
+    sources: Vec<Arc<Source>>,
+    inline: FxHashSet<String>,
+    raw: ArcSwap<FxHashSet<String>>,
+}
+
+impl DomainSet {
+    fn new(urls: &[String], domains: &[String], refresh_interval: Duration) -> Self {
+        let sources = urls
+            .iter()
+            .map(|url| {
+                Arc::new(Source {
+                    url: url.clone(),
+                    refresh_interval,
+                    set: Mutex::new(Arc::new(FxHashSet::default())),
+                })
+            })
+            .collect();
+        let inline = domains.iter().map(|d| normalize_name(d)).collect();
+        Self {
+            sources,
+            inline,
+            raw: ArcSwap::from_pointee(FxHashSet::default()),
+        }
+    }
+
+    /// Recomputes `raw` as the inline domains union every source's most
+    /// recent fetch. Called after any source in this direction refreshes.
+    fn recompute_raw(&self) {
+        let mut merged = self.inline.clone();
+        for src in &self.sources {
+            merged.extend(src.set.lock().unwrap().iter().cloned());
+        }
+        self.raw.store(Arc::new(merged));
+    }
+
+    fn len(&self) -> usize {
+        self.raw.load().len()
+    }
+}
+
 pub struct BlocklistManager {
     http: reqwest::Client,
-    sources: Vec<Arc<Source>>,
-    /// Subtracted from `merged` on every rebuild, so a refresh can't bring a
-    /// whitelisted domain back.
-    whitelist: FxHashSet<String>,
+    block: DomainSet,
+    allow: DomainSet,
     merged: BlockSet,
 }
 
@@ -60,25 +106,17 @@ impl BlocklistManager {
             .build()
             .expect("failed to build blocklist HTTP client");
 
-        let refresh_interval = Duration::from_secs(config.refresh_interval_secs);
-        let sources = config
-            .urls
-            .iter()
-            .map(|url| {
-                Arc::new(Source {
-                    url: url.clone(),
-                    refresh_interval,
-                    set: Mutex::new(Arc::new(FxHashSet::default())),
-                })
-            })
-            .collect();
-
-        let whitelist = whitelist.domains.iter().map(|d| normalize_name(d)).collect();
+        let block = DomainSet::new(&config.urls, &config.domains, Duration::from_secs(config.refresh_interval_secs));
+        let allow = DomainSet::new(
+            &whitelist.urls,
+            &whitelist.domains,
+            Duration::from_secs(whitelist.refresh_interval_secs),
+        );
 
         Self {
             http,
-            sources,
-            whitelist,
+            block,
+            allow,
             merged: Arc::new(ArcSwap::from_pointee(FxHashSet::default())),
         }
     }
@@ -87,13 +125,14 @@ impl BlocklistManager {
         self.merged.clone()
     }
 
-    /// Fetches every source concurrently, publishes the merged set, then
-    /// spawns a background refresh loop per source until `shutdown` fires.
-    /// A source that fails to fetch keeps its previous contents rather than
-    /// taking the server down.
+    /// Fetches every blocklist and whitelist URL source concurrently,
+    /// publishes the merged set, then spawns a background refresh loop per
+    /// source - blocklist and whitelist sources alike, each on its own
+    /// schedule - until `shutdown` fires. A source that fails to fetch
+    /// keeps its previous contents rather than taking the server down.
     pub async fn start(self: &Arc<Self>, shutdown: CancellationToken) {
-        let mut handles = Vec::with_capacity(self.sources.len());
-        for src in &self.sources {
+        let mut handles = Vec::with_capacity(self.block.sources.len() + self.allow.sources.len());
+        for src in self.block.sources.iter().chain(self.allow.sources.iter()) {
             let this = Arc::clone(self);
             let src = Arc::clone(src);
             handles.push(tokio::spawn(async move { this.fetch_and_store(&src).await }));
@@ -101,17 +140,28 @@ impl BlocklistManager {
         for h in handles {
             let _ = h.await;
         }
+        self.block.recompute_raw();
+        self.allow.recompute_raw();
         self.republish_merged();
         info!(
             domains = self.merged.load().len(),
-            sources = self.sources.len(),
-            whitelisted = self.whitelist.len(),
-            "initial blocklist fetch complete"
+            blocklist_sources = self.block.sources.len(),
+            whitelist_sources = self.allow.sources.len(),
+            whitelisted = self.allow.len(),
+            "initial blocklist/whitelist fetch complete"
         );
 
-        for src in &self.sources {
+        self.spawn_refresh_loops(|m| &m.block, shutdown.clone());
+        self.spawn_refresh_loops(|m| &m.allow, shutdown);
+    }
+
+    /// Spawns one refresh loop per source in the direction `accessor`
+    /// selects (the blocklist or the whitelist). A plain fn pointer instead
+    /// of a `&DomainSet` borrow, since each loop is a `'static` spawned
+    /// task and re-derives the set it needs from `this: Arc<Self>` itself.
+    fn spawn_refresh_loops(self: &Arc<Self>, accessor: fn(&BlocklistManager) -> &DomainSet, shutdown: CancellationToken) {
+        for src in accessor(self).sources.clone() {
             let this = Arc::clone(self);
-            let src = Arc::clone(src);
             let shutdown = shutdown.clone();
             tokio::spawn(async move {
                 loop {
@@ -120,6 +170,11 @@ impl BlocklistManager {
                         _ = shutdown.cancelled() => return,
                     }
                     this.fetch_and_store(&src).await;
+                    // Either direction refreshing can change the final
+                    // published set, so both are recomputed regardless of
+                    // which one just changed.
+                    this.block.recompute_raw();
+                    this.allow.recompute_raw();
                     this.republish_merged();
                 }
             });
@@ -131,10 +186,10 @@ impl BlocklistManager {
             Ok(set) => {
                 let count = set.len();
                 *src.set.lock().unwrap() = Arc::new(set);
-                info!(url = %src.url, domains = count, "blocklist source refreshed");
+                info!(url = %src.url, domains = count, "domain list source refreshed");
             }
             Err(err) => {
-                warn!(url = %src.url, error = %err, "blocklist refresh failed, keeping previous contents");
+                warn!(url = %src.url, error = %err, "domain list refresh failed, keeping previous contents");
             }
         }
     }
@@ -146,12 +201,8 @@ impl BlocklistManager {
     }
 
     fn republish_merged(&self) {
-        let mut merged = FxHashSet::default();
-        for src in &self.sources {
-            let snapshot = src.set.lock().unwrap().clone();
-            merged.extend(snapshot.iter().cloned());
-        }
-        for domain in &self.whitelist {
+        let mut merged = (*self.block.raw.load_full()).clone();
+        for domain in self.allow.raw.load().iter() {
             merged.remove(domain);
         }
         self.merged.store(Arc::new(merged));
@@ -164,6 +215,12 @@ impl BlocklistManager {
 /// one — an earlier parser treated `#` as a trailing comment marker and
 /// truncated these down to a bare (and very much not blocked-worthy) domain,
 /// NXDOMAIN'ing half the web. Only a line starting with `#` is a comment now.
+///
+/// Used identically for both `[blocklists]` and `[whitelist]` URLs - a
+/// whitelist source is just a list of domains to allow, in the same
+/// formats. It does not give Adblock exception rules (`@@||domain^`) any
+/// special "this means allow" meaning; those are simply not extracted by
+/// this parser regardless of which direction it's used for.
 pub fn parse_list(body: &str) -> FxHashSet<String> {
     let mut set = FxHashSet::default();
     for raw_line in body.lines() {
@@ -243,28 +300,92 @@ fn looks_like_domain(s: &str) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn whitelist_removes_domains_from_merged_set_even_after_refresh() {
-        let config = BlocklistsConfig {
-            urls: vec!["https://example.invalid/list.txt".to_string()],
+    fn blocklists_config(urls: Vec<String>, domains: Vec<String>) -> BlocklistsConfig {
+        BlocklistsConfig {
+            urls,
+            domains,
             refresh_interval_secs: 43_200,
-        };
-        let whitelist = WhitelistConfig {
-            domains: vec!["s.youtube.com".to_string()],
-        };
+        }
+    }
+
+    fn whitelist_config(urls: Vec<String>, domains: Vec<String>) -> WhitelistConfig {
+        WhitelistConfig {
+            urls,
+            domains,
+            refresh_interval_secs: 43_200,
+        }
+    }
+
+    /// Simulates a source fetch landing entries directly (bypassing real
+    /// HTTP), then re-derives the merged set the same way a background
+    /// refresh would.
+    fn land_fetch(manager: &BlocklistManager, set: &DomainSet, source_index: usize, domains: &[&str]) {
+        *set.sources[source_index].set.lock().unwrap() = Arc::new(domains.iter().map(|d| d.to_string()).collect());
+        manager.block.recompute_raw();
+        manager.allow.recompute_raw();
+        manager.republish_merged();
+    }
+
+    #[test]
+    fn inline_blocklist_domains_are_blocked_with_no_urls_configured() {
+        let config = blocklists_config(vec![], vec!["ads.example.com".to_string()]);
+        let whitelist = whitelist_config(vec![], vec![]);
+        let manager = BlocklistManager::new(&config, &whitelist);
+        manager.block.recompute_raw();
+        manager.allow.recompute_raw();
+        manager.republish_merged();
+
+        assert!(manager.merged_set().load().contains("ads.example.com."));
+    }
+
+    #[test]
+    fn inline_whitelist_domains_remove_domains_from_the_merged_set_even_after_refresh() {
+        let config = blocklists_config(vec!["https://example.invalid/list.txt".to_string()], vec![]);
+        let whitelist = whitelist_config(vec![], vec!["s.youtube.com".to_string()]);
         let manager = BlocklistManager::new(&config, &whitelist);
 
-        // Simulate a source fetch landing entries directly, then re-derive
-        // the merged set the same way a background refresh would.
-        *manager.sources[0].set.lock().unwrap() =
-            Arc::new(["ads.example.com.".to_string(), "s.youtube.com.".to_string()].into_iter().collect());
-        manager.republish_merged();
+        land_fetch(&manager, &manager.block, 0, &["ads.example.com.", "s.youtube.com."]);
 
         let merged = manager.merged_set();
         assert!(merged.load().contains("ads.example.com."));
         assert!(
             !merged.load().contains("s.youtube.com."),
             "whitelisted domain must never appear in the merged set, even though a source lists it"
+        );
+    }
+
+    #[test]
+    fn whitelist_urls_remove_domains_from_the_merged_set_just_like_inline_whitelist_domains() {
+        let config = blocklists_config(vec!["https://example.invalid/block.txt".to_string()], vec![]);
+        let whitelist = whitelist_config(vec!["https://example.invalid/allow.txt".to_string()], vec![]);
+        let manager = BlocklistManager::new(&config, &whitelist);
+
+        land_fetch(&manager, &manager.block, 0, &["ads.example.com.", "s.youtube.com."]);
+        land_fetch(&manager, &manager.allow, 0, &["s.youtube.com."]);
+
+        let merged = manager.merged_set();
+        assert!(merged.load().contains("ads.example.com."));
+        assert!(
+            !merged.load().contains("s.youtube.com."),
+            "a domain listed by a whitelist URL source must be removed from the merged set, same as an inline whitelist domain"
+        );
+    }
+
+    #[test]
+    fn a_whitelist_source_refreshing_on_its_own_can_un_block_a_domain() {
+        // The domain starts out blocked (only the blocklist source has run).
+        let config = blocklists_config(vec!["https://example.invalid/block.txt".to_string()], vec![]);
+        let whitelist = whitelist_config(vec!["https://example.invalid/allow.txt".to_string()], vec![]);
+        let manager = BlocklistManager::new(&config, &whitelist);
+        land_fetch(&manager, &manager.block, 0, &["s.youtube.com."]);
+        assert!(manager.merged_set().load().contains("s.youtube.com."), "should start out blocked");
+
+        // The whitelist source refreshing on its own schedule (independent
+        // of any blocklist refresh) must be enough to un-block it.
+        land_fetch(&manager, &manager.allow, 0, &["s.youtube.com."]);
+        assert!(
+            !manager.merged_set().load().contains("s.youtube.com."),
+            "a whitelist source refreshing on its own must be able to un-block a domain, without needing the blocklist to refresh too"
         );
     }
 
