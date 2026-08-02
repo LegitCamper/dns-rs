@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
+use bytes::Bytes;
 use futures_util::future::select_ok;
 use hickory_proto::op::Message;
 use rustls_pki_types::ServerName;
@@ -110,7 +111,12 @@ impl Upstream for SingleUpstream {
 
         let response_bytes = match &self.backend {
             Backend::Dot(pool) => query_dot(pool, &wire).await?,
-            Backend::Doh { url, http } => query_doh(http, url, &wire).await?,
+            // `Bytes` instead of `&[u8]`: reqwest's request body needs
+            // ownership, and the retry-once path in query_doh needs the
+            // same bytes twice - wrapping once here (no copy, just takes
+            // the Vec's buffer) means both uses are a cheap refcount clone
+            // instead of each paying their own full byte copy.
+            Backend::Doh { url, http } => query_doh(http, url, Bytes::from(wire)).await?,
         };
 
         let response = Message::from_vec(&response_bytes).context("failed to decode upstream response")?;
@@ -298,8 +304,13 @@ async fn query_dot(pool: &DotPool, wire: &[u8]) -> Result<Vec<u8>> {
 
 async fn exchange(tls: &mut TlsStream<TcpStream>, wire: &[u8]) -> Result<Vec<u8>> {
     let len = u16::try_from(wire.len()).context("query too large for DoT framing")?;
-    tls.write_all(&len.to_be_bytes()).await?;
-    tls.write_all(wire).await?;
+    // One write for the length prefix + body, rather than two, so it's a
+    // single TCP segment instead of two back-to-back ones (same reasoning
+    // as the server side's framing in server::dot::handle_connection).
+    let mut framed = Vec::with_capacity(2 + wire.len());
+    framed.extend_from_slice(&len.to_be_bytes());
+    framed.extend_from_slice(wire);
+    tls.write_all(&framed).await?;
     tls.flush().await?;
 
     let mut len_buf = [0u8; 2];
@@ -310,8 +321,11 @@ async fn exchange(tls: &mut TlsStream<TcpStream>, wire: &[u8]) -> Result<Vec<u8>
     Ok(resp_buf)
 }
 
-async fn query_doh(http: &reqwest::Client, url: &str, wire: &[u8]) -> Result<Vec<u8>> {
-    match send_doh(http, url, wire).await {
+async fn query_doh(http: &reqwest::Client, url: &str, wire: Bytes) -> Result<Vec<u8>> {
+    // Only clone (a cheap refcount bump, not a byte copy) if a retry might
+    // need the same payload again; the original `wire` stays intact for
+    // that second attempt without ever copying the bytes twice.
+    match send_doh(http, url, wire.clone()).await {
         Ok(resp) => Ok(resp),
         // reqwest's pooled connections can go stale the same way DoT's can
         // (idle keep-alive closed by the server, mid-flight reset under load,
@@ -347,12 +361,12 @@ fn describe_std_error(err: &(dyn std::error::Error + 'static)) -> String {
     parts.join(": ")
 }
 
-async fn send_doh(http: &reqwest::Client, url: &str, wire: &[u8]) -> Result<Vec<u8>, reqwest::Error> {
+async fn send_doh(http: &reqwest::Client, url: &str, wire: Bytes) -> Result<Vec<u8>, reqwest::Error> {
     let resp = http
         .post(url)
         .header("content-type", "application/dns-message")
         .header("accept", "application/dns-message")
-        .body(wire.to_vec())
+        .body(wire)
         .send()
         .await?
         .error_for_status()?;
@@ -648,7 +662,7 @@ mod tests {
         let (addr, counter) = spawn_doh_mock(tls.server_config, DohMockMode::FailFirstBodyThenSucceed).await;
 
         let url = format!("https://127.0.0.1:{}/dns-query", addr.port());
-        let response = query_doh(&http, &url, b"query-bytes").await.expect("should succeed after retrying once");
+        let response = query_doh(&http, &url, Bytes::from_static(b"query-bytes")).await.expect("should succeed after retrying once");
 
         assert_eq!(response, b"good-response");
         assert_eq!(counter.load(Ordering::SeqCst), 2, "exactly one retry should have been attempted");
@@ -661,7 +675,7 @@ mod tests {
         let (addr, counter) = spawn_doh_mock(tls.server_config, DohMockMode::AlwaysServerError).await;
 
         let url = format!("https://127.0.0.1:{}/dns-query", addr.port());
-        let err = query_doh(&http, &url, b"query-bytes").await.expect_err("a real HTTP error status must surface as an error");
+        let err = query_doh(&http, &url, Bytes::from_static(b"query-bytes")).await.expect_err("a real HTTP error status must surface as an error");
 
         assert_eq!(counter.load(Ordering::SeqCst), 1, "a real HTTP error status must not be retried");
         assert!(!format!("{err:#}").is_empty());

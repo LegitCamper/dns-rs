@@ -426,6 +426,10 @@ async def scenario_smoke() -> bool:
             ok &= check("server still alive after malformed query", server.is_alive())
 
             # Multiple distinct queries pipelined on one DoT connection.
+            # Queries are now processed concurrently (see below), so
+            # responses may arrive in a different order than requests were
+            # sent - match by ID, not by position, same as a real client
+            # (e.g. dnspython/dig) would.
             ctx = ssl.create_default_context(cafile=str(CERT_PATH))
             reader, writer = await asyncio.open_connection("127.0.0.1", dot_port, ssl=ctx, server_hostname="localhost")
             queries = [make_query(f"pipeline-{i}.nas.home" if i == 0 else "nas.home", "A") for i in range(3)]
@@ -438,12 +442,54 @@ async def scenario_smoke() -> bool:
                 length = int.from_bytes(await reader.readexactly(2), "big")
                 responses.append(dns.message.from_wire(await reader.readexactly(length)))
             writer.close()
+            responses_by_id = {r.id: r for r in responses}
             ok &= check(
-                "pipelined DoT queries each get the right matching response",
-                all(r.id == q.id for r, q in zip(responses, queries)),
+                "pipelined DoT queries each get a response matching their own ID",
+                {q.id for q in queries} == set(responses_by_id) and all(responses_by_id[q.id].id == q.id for q in queries),
             )
     finally:
         blocklist_server.stop()
+
+    # Concurrency proof: a slow pipelined miss must not block a faster
+    # pipelined query behind it. Upstream is a "blackhole" that never
+    # responds, so the miss stalls for the full upstream timeout - if the
+    # connection still processed queries one at a time (the old behavior),
+    # the first byte back on the wire would necessarily be that slow
+    # response. With per-query concurrency, the fast static-host answer
+    # should come back first, in well under a second.
+    blackhole_server, blackhole_port = await start_blackhole_server()
+    try:
+        conc_dot_port, conc_doh_port = free_port(), free_port()
+        conc_config = render_config(
+            dot_port=conc_dot_port, doh_port=conc_doh_port,
+            upstream_urls=[f"tls://127.0.0.1:{blackhole_port}#dead"],
+            static_hosts={"fast.home": "10.0.0.9"},
+        )
+        with DnsRsServer("dot-pipelining-concurrency", conc_config):
+            ctx = ssl.create_default_context(cafile=str(CERT_PATH))
+            reader, writer = await asyncio.open_connection("127.0.0.1", conc_dot_port, ssl=ctx, server_hostname="localhost")
+            slow_query = make_query("slow-miss.invalid", "A")
+            fast_query = make_query("fast.home", "A")
+            for q in (slow_query, fast_query):
+                wire = q.to_wire()
+                writer.write(len(wire).to_bytes(2, "big") + wire)
+            await writer.drain()
+
+            t0 = time.monotonic()
+            first_length = int.from_bytes(await reader.readexactly(2), "big")
+            first_resp = dns.message.from_wire(await reader.readexactly(first_length))
+            first_elapsed = time.monotonic() - t0
+            writer.close()
+
+            ok &= check(
+                "a slow pipelined miss doesn't block a faster query behind it",
+                first_resp.id == fast_query.id and first_elapsed < 1.0,
+                detail=f"first response back in {first_elapsed * 1000:.0f}ms and {'was' if first_resp.id == fast_query.id else 'was NOT'} the fast one "
+                f"(the slow one stalls ~{UPSTREAM_TIMEOUT:.0f}s against the blackhole)",
+            )
+    finally:
+        blackhole_server.close()
+
     return ok
 
 
