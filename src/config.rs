@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -33,8 +33,12 @@ pub struct ServerConfig {
     pub dot_port: u16,
     #[serde(default = "default_doh_port")]
     pub doh_port: u16,
-    pub tls_cert: PathBuf,
-    pub tls_key: PathBuf,
+    /// May be omitted if `DNS_RS_TLS_CERT_B64`/`DNS_RS_TLS_KEY_B64` are set
+    /// instead — see `tls::resolve_tls_material`.
+    #[serde(default)]
+    pub tls_cert: Option<PathBuf>,
+    #[serde(default)]
+    pub tls_key: Option<PathBuf>,
     #[serde(default = "default_ttl")]
     pub default_ttl: u32,
 }
@@ -217,26 +221,25 @@ pub struct CacheConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Total bytes reserved for cache storage, allocated once as a single
-    /// pool that responses are suballocated from (see `dns::cache`).
-    #[serde(default = "default_max_size_bytes")]
-    pub max_size_bytes: u64,
+    /// pool that responses are suballocated from (see `dns::cache`). If
+    /// unset, `memlimit::resolve_cache_max_bytes` picks a default — a
+    /// share of the container's cgroup memory limit if one is detected,
+    /// otherwise a fixed fallback.
+    #[serde(default)]
+    pub max_size_bytes: Option<u64>,
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             enabled: default_true(),
-            max_size_bytes: default_max_size_bytes(),
+            max_size_bytes: None,
         }
     }
 }
 
 fn default_true() -> bool {
     true
-}
-
-fn default_max_size_bytes() -> u64 {
-    64 * 1024 * 1024 // 64 MiB
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -246,11 +249,10 @@ pub struct StaticHost {
 }
 
 impl Config {
-    pub fn load(path: &Path) -> Result<Config> {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read config file at {}", path.display()))?;
-        let config: Config = toml::from_str(&raw)
-            .with_context(|| format!("failed to parse config file at {}", path.display()))?;
+    /// Parses and validates a TOML config document, regardless of where its
+    /// raw text came from (a local file or an env var — see `main::ConfigSource`).
+    pub fn parse(raw: &str) -> Result<Config> {
+        let config: Config = toml::from_str(raw).context("failed to parse config")?;
         config.validate()?;
         Ok(config)
     }
@@ -260,18 +262,12 @@ impl Config {
             bail!("config must define at least one entry in [upstream] urls");
         }
         self.parsed_upstreams()?;
-        if !self.server.tls_cert.is_file() {
-            bail!(
-                "server.tls_cert does not point to a file: {}",
-                self.server.tls_cert.display()
-            );
-        }
-        if !self.server.tls_key.is_file() {
-            bail!(
-                "server.tls_key does not point to a file: {}",
-                self.server.tls_key.display()
-            );
-        }
+        check_tls_source(
+            &self.server.tls_cert,
+            &self.server.tls_key,
+            std::env::var(crate::tls::TLS_CERT_ENV).is_ok(),
+            std::env::var(crate::tls::TLS_KEY_ENV).is_ok(),
+        )?;
         if self.server.dot_port == self.server.doh_port {
             bail!("server.dot_port and server.doh_port must be different");
         }
@@ -301,5 +297,108 @@ impl Config {
                 )
             })
             .collect()
+    }
+}
+
+/// Decides where TLS material comes from, given the two `Option<PathBuf>`
+/// config fields and whether the corresponding env var
+/// (`tls::TLS_CERT_ENV`/`TLS_KEY_ENV`) is set. Takes plain bools for the env
+/// checks (rather than reading `std::env` itself) so this is unit-testable
+/// without mutating real process state.
+fn check_tls_source(cert: &Option<PathBuf>, key: &Option<PathBuf>, cert_env: bool, key_env: bool) -> Result<()> {
+    match (cert_env, key_env) {
+        (true, true) => Ok(()),
+        (true, false) | (false, true) => {
+            bail!(
+                "both {} and {} must be set together, or neither",
+                crate::tls::TLS_CERT_ENV,
+                crate::tls::TLS_KEY_ENV
+            )
+        }
+        (false, false) => {
+            let cert = cert.as_ref().with_context(|| {
+                format!(
+                    "server.tls_cert must be set, or set {}/{} instead",
+                    crate::tls::TLS_CERT_ENV,
+                    crate::tls::TLS_KEY_ENV
+                )
+            })?;
+            if !cert.is_file() {
+                bail!("server.tls_cert does not point to a file: {}", cert.display());
+            }
+            let key = key.as_ref().with_context(|| {
+                format!(
+                    "server.tls_key must be set, or set {}/{} instead",
+                    crate::tls::TLS_CERT_ENV,
+                    crate::tls::TLS_KEY_ENV
+                )
+            })?;
+            if !key.is_file() {
+                bail!("server.tls_key does not point to a file: {}", key.display());
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_toml() -> String {
+        format!(
+            "[server]\ntls_cert = {:?}\ntls_key = {:?}\n\n[upstream]\nurls = [\"https://cloudflare-dns.com/dns-query\"]\n",
+            env!("CARGO_MANIFEST_DIR").to_string() + "/Cargo.toml",
+            env!("CARGO_MANIFEST_DIR").to_string() + "/Cargo.lock",
+        )
+    }
+
+    #[test]
+    fn parse_accepts_minimal_valid_config() {
+        Config::parse(&base_toml()).expect("minimal config should parse and validate");
+    }
+
+    #[test]
+    fn parse_rejects_missing_upstream_urls() {
+        let toml = base_toml().replace("urls = [\"https://cloudflare-dns.com/dns-query\"]", "urls = []");
+        let err = Config::parse(&toml).unwrap_err();
+        assert!(err.to_string().contains("upstream"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn parse_rejects_equal_dot_and_doh_ports() {
+        let toml = base_toml().replace("[server]\n", "[server]\ndot_port = 1000\ndoh_port = 1000\n");
+        let err = Config::parse(&toml).unwrap_err();
+        assert!(err.to_string().contains("dot_port"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn parse_rejects_nonexistent_cert_path_with_no_env_vars() {
+        let toml = base_toml().replace(
+            &(env!("CARGO_MANIFEST_DIR").to_string() + "/Cargo.toml"),
+            "/does/not/exist.pem",
+        );
+        let err = Config::parse(&toml).unwrap_err();
+        assert!(err.to_string().contains("tls_cert"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn check_tls_source_both_env_set_ignores_file_paths() {
+        check_tls_source(&None, &None, true, true).expect("both env vars set should be fine with no file paths");
+    }
+
+    #[test]
+    fn check_tls_source_exactly_one_env_set_is_an_error() {
+        assert!(check_tls_source(&None, &None, true, false).is_err());
+        assert!(check_tls_source(&None, &None, false, true).is_err());
+    }
+
+    #[test]
+    fn check_tls_source_no_env_requires_both_paths_present_and_real_files() {
+        assert!(check_tls_source(&None, &None, false, false).is_err());
+        let real = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        assert!(check_tls_source(&Some(real.clone()), &Some(real.clone()), false, false).is_ok());
+        let missing = PathBuf::from("/does/not/exist.pem");
+        assert!(check_tls_source(&Some(missing), &Some(real), false, false).is_err());
     }
 }

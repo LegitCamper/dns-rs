@@ -1,5 +1,4 @@
 use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,12 +51,12 @@ struct DohGetParams {
 /// axum-server negotiates HTTP/1.1 or h2 over ALPN automatically.
 pub async fn serve(
     addr: SocketAddr,
-    cert: &Path,
-    key: &Path,
+    cert: &[u8],
+    key: &[u8],
     state: Arc<AppState>,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    let tls_config = RustlsConfig::from_pem_file(cert, key)
+    let tls_config = RustlsConfig::from_pem(cert.to_vec(), key.to_vec())
         .await
         .context("failed to load DoH TLS certificate/key")?;
 

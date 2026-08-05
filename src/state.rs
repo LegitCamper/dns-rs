@@ -36,7 +36,8 @@ impl AppState<SingleUpstream> {
         let blocklist_manager = Arc::new(BlocklistManager::new(&config.blocklists, &config.whitelist));
         blocklist_manager.start(shutdown.clone()).await;
 
-        let cache = Arc::new(ResponseCache::new(config.cache.enabled, config.cache.max_size_bytes));
+        let cache_max_bytes = crate::memlimit::resolve_cache_max_bytes(config.cache.max_size_bytes);
+        let cache = Arc::new(ResponseCache::new(config.cache.enabled, cache_max_bytes));
         cache.start_ttl_sweeper(shutdown);
 
         let upstream_configs = config.parsed_upstreams()?;

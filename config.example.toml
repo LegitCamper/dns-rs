@@ -1,5 +1,10 @@
 # Example dns-rs configuration.
 # Copy to config.toml (or pass --config <path>) and adjust for your deployment.
+#
+# This whole document can alternatively be handed to dns-rs via the
+# DNS_RS_CONFIG env var instead of a file (it takes priority over --config
+# when set) — for platforms that don't offer a persistent mounted config
+# file. See the README's "Deploying without local files (PaaS)" section.
 
 [server]
 # Binds to all interfaces by default. Standard DoT/DoH ports (853/443) require
@@ -7,6 +12,9 @@
 # bind_address = "0.0.0.0"
 dot_port = 853
 doh_port = 443
+# May be omitted entirely if DNS_RS_TLS_CERT_B64/DNS_RS_TLS_KEY_B64 are set
+# instead (base64-encoded PEM content) — those always take priority over
+# these paths when both env vars are set. See the README.
 tls_cert = "/etc/dns-rs/fullchain.pem"
 tls_key = "/etc/dns-rs/privkey.pem"
 # TTL used for synthesized static-host and sinkhole answers.
@@ -21,10 +29,8 @@ mode = "nxdomain"
 sinkhole_ip = "0.0.0.0"
 
 [blocklists]
-refresh_interval_secs = 43200  # applies to every URL below
-urls = [
-  "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
-]
+refresh_interval_secs = 43200                                               # applies to every URL below
+urls = ["https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"]
 # Literal domains to always block, in addition to whatever the URLs above
 # resolve to. Checked as exact names (not by subdomain).
 domains = [
@@ -35,7 +41,7 @@ domains = [
 # Same shape as [blocklists] above: domains that must never be blocked, even
 # if a source in [blocklists] lists them - checked as exact names (not by
 # subdomain). Either urls, domains, or both may be used.
-refresh_interval_secs = 43200  # applies to every URL below
+refresh_interval_secs = 43200 # applies to every URL below
 urls = [
   # "https://example.com/known-good-domains.txt",
 ]
@@ -81,4 +87,9 @@ enabled = true
 # case). Nothing about serving a request grows, shrinks, or reallocates this
 # pool. If it fills up, expired entries are evicted first, then
 # least-recently-used ones, until the next response fits.
-max_size_bytes = 67108864  # 64 MiB
+#
+# If omitted (or set via the DNS_RS_CACHE_MAX_BYTES env var, which always
+# takes priority), the default is 70% of the container's cgroup memory limit
+# when one is detected, or 64 MiB otherwise (e.g. bare-metal/systemd
+# self-hosting typically has no cgroup memory limit, so 64 MiB applies).
+max_size_bytes = 67108864 # 64 MiB

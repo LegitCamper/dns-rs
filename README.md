@@ -45,10 +45,11 @@ than its author. Read the code before you point production traffic at it.
   upstream in order) or race (query all of them, take whichever answers
   first). Duplicate in-flight queries for the same name/type are coalesced
   into a single upstream request.
-- **Hot config reload** — the config file is polled for changes and a
-  changed file is reloaded without dropping the process or existing
-  connections (in-flight requests get a grace period before the old
-  listeners are torn down).
+- **Hot config reload** — the config source (a local file, or `DNS_RS_CONFIG`,
+  see [Deploying without local files](#deploying-without-local-files-paas)
+  below) is polled for changes and a change is reloaded without dropping the
+  process or existing connections (in-flight requests get a grace period
+  before the old listeners are torn down).
 
 ## What it doesn't do
 
@@ -85,6 +86,58 @@ You need a TLS certificate and key regardless of deployment method — both
 listeners require one. A self-signed cert is fine for a home network as
 long as your clients are configured to trust it; a real cert (e.g. from a
 DNS-validated ACME issuance) works too if the resolver has a public name.
+`server.tls_cert`/`tls_key` above are the default file-path source; see the
+next section for a file-less alternative.
+
+### Deploying without local files (PaaS)
+
+The options above assume a local config file and local TLS files, which is
+the right default for self-hosting. Deploying on a platform that doesn't
+offer a persistent mounted volume (Fly.io, Railway, Render, and similar
+"app" platforms) is also supported, entirely via opt-in env vars — nothing
+below changes any default behavior for the file-based path.
+
+- **`DNS_RS_CONFIG`** — if set, its content is used as the whole TOML config
+  document instead of reading `--config <path>`. Takes priority over
+  `--config` whenever it's set. Since env vars can't change under a running
+  process, a config sourced this way has no in-process hot reload — updating
+  it means restarting the process with the new value, which is exactly what
+  happens when you update a secret on most of these platforms anyway.
+  File-based config keeps its existing 5-second poll-and-reload behavior
+  unchanged.
+- **`DNS_RS_TLS_CERT_B64`** / **`DNS_RS_TLS_KEY_B64`** — base64-encoded PEM
+  cert chain and private key (e.g. `DNS_RS_TLS_CERT_B64=$(base64 -w0
+  cert.pem)`), set together, as an alternative to `server.tls_cert`/
+  `tls_key` file paths. When both are set they always take priority, whether
+  the rest of the config came from a file or from `DNS_RS_CONFIG` — the two
+  are independent choices. Setting only one is a startup error. These are
+  deliberately kept separate from `DNS_RS_CONFIG` rather than embedded as
+  TOML fields: a private key sitting inside the same blob as ordinary
+  settings widens its blast radius (it'd sit in whatever the platform's
+  dashboard shows for that one secret, and in the raw text this process
+  keeps in memory for reload-diffing) for no benefit, when most platforms'
+  secrets stores already let you manage a key as its own named, redactable,
+  independently-rotatable secret. `server.tls_cert`/`tls_key` in config.toml
+  may be omitted entirely when using these.
+- **`DNS_RS_CACHE_MAX_BYTES`** — explicit override for the response cache's
+  byte budget, taking priority over `[cache].max_size_bytes`. If neither is
+  set, the default is no longer always a flat 64 MiB: dns-rs reads the
+  container's cgroup memory limit (v2 `memory.max`, falling back to v1
+  `memory.limit_in_bytes`) and, if one is found, defaults the cache to 70% of
+  it — leaving headroom for the blocklist set, tokio, and connection
+  buffers. A typical bare-metal/systemd self-hosted install has no cgroup
+  memory limit at all, so this is a no-op there and the flat 64 MiB default
+  applies exactly as before; it only activates in an actually memory-capped
+  container.
+
+Example fully file-less invocation:
+
+```sh
+DNS_RS_CONFIG="$(curl -fsSL https://raw.githubusercontent.com/<you>/<repo>/main/config.toml)" \
+DNS_RS_TLS_CERT_B64="$(base64 -w0 cert.pem)" \
+DNS_RS_TLS_KEY_B64="$(base64 -w0 key.pem)" \
+dns-rs
+```
 
 ## Running it
 
