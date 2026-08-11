@@ -81,10 +81,13 @@ COPY --from=builder /build/output/ /usr/local/bin/
 # (verified: the running process's own /proc/self/exe reports the payload's
 # real path, not a copied-into-memory one) rather than the launcher itself,
 # so the capability grant has to go on every payload file, not just the
-# launcher. No-op on arm64, where there's no dns-rs.bundle/ directory.
+# launcher. Each payload lives in its own per-CPU subdirectory (e.g.
+# dns-rs.bundle/x86-64-v3/dns-rs), not flat inside dns-rs.bundle/ - `find`
+# instead of a glob so this doesn't care about that nesting or naming.
+# No-op on arm64, where there's no dns-rs.bundle/ directory.
 RUN setcap 'cap_net_bind_service=+ep' /usr/local/bin/dns-rs \
     && if [ -d /usr/local/bin/dns-rs.bundle ]; then \
-         for f in /usr/local/bin/dns-rs.bundle/*.elf; do setcap 'cap_net_bind_service=+ep' "$f"; done; \
+         find /usr/local/bin/dns-rs.bundle -type f -exec setcap 'cap_net_bind_service=+ep' {} \; ; \
        fi
 
 USER dns-rs
