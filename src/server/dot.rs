@@ -1,10 +1,12 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
+use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -25,6 +27,24 @@ const MAX_MESSAGE_SIZE: usize = 65535;
 /// unboundedly ahead.
 const MAX_CONCURRENT_QUERIES_PER_CONNECTION: usize = 32;
 
+/// Hard ceiling on concurrently open DoT connections, independent of the
+/// per-connection query cap above. Port 853 draws constant unsolicited
+/// scanner traffic from the open internet, and each open connection costs a
+/// task, a semaphore, an mpsc channel, and an `Arc<AppState>` clone - this
+/// bounds how many a peer that just holds the socket open can pin.
+const MAX_CONCURRENT_CONNECTIONS: usize = 512;
+
+/// How long a connection may sit with no new query starting before it's
+/// closed. Long enough that a real client's normal query cadence never
+/// trips it; short enough that one that never sends a real query gets
+/// reclaimed instead of sitting open indefinitely.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Once a query's length prefix has arrived, how long the rest of that one
+/// message may take. Much shorter than `IDLE_TIMEOUT`: a client mid-message
+/// should finish in milliseconds, not seconds.
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// RFC 7858 DNS-over-TLS listener, 2-byte length-prefixed framing (same as
 /// classic DNS-over-TCP); a connection may carry multiple pipelined queries.
 /// Stops accepting new connections once `shutdown` fires; already-accepted
@@ -39,6 +59,7 @@ pub async fn serve(
         .await
         .with_context(|| format!("failed to bind DoT listener on {addr}"))?;
     let acceptor = TlsAcceptor::from(tls_config);
+    let connections = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     info!(%addr, "DoT listener ready");
 
     loop {
@@ -55,6 +76,15 @@ pub async fn serve(
                 }
             },
         };
+
+        // Rejected outright rather than queued: a flood of connections that
+        // may never even complete a TLS handshake shouldn't be able to make
+        // legitimate clients wait behind them.
+        let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else {
+            debug!(%peer, "DoT connection limit reached, rejecting");
+            continue;
+        };
+
         // Without this, Nagle's algorithm can hold small DNS responses back
         // waiting to coalesce with more outbound data, adding tens of
         // milliseconds of pure buffering delay per query for no benefit here.
@@ -62,6 +92,7 @@ pub async fn serve(
         let acceptor = acceptor.clone();
         let state = Arc::clone(&state);
         tokio::spawn(async move {
+            let _permit = permit; // held for the connection's lifetime, released on drop
             if let Err(err) = handle_connection(acceptor, tcp, state).await {
                 debug!(%peer, error = %err, "DoT connection ended");
             }
@@ -106,11 +137,14 @@ async fn handle_connection(acceptor: TlsAcceptor, tcp: TcpStream, state: Arc<App
     let result: Result<()> = async {
         loop {
             let mut len_buf = [0u8; 2];
-            if let Err(err) = read_half.read_exact(&mut len_buf).await {
-                if err.kind() == std::io::ErrorKind::UnexpectedEof {
+            match timeout(IDLE_TIMEOUT, read_half.read_exact(&mut len_buf)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                Ok(Err(err)) => return Err(err).context("failed to read message length prefix"),
+                Err(_) => {
+                    debug!("closing idle DoT connection");
                     return Ok(());
                 }
-                return Err(err).context("failed to read message length prefix");
             }
             let len = u16::from_be_bytes(len_buf) as usize;
             if len == 0 || len > MAX_MESSAGE_SIZE {
@@ -118,7 +152,11 @@ async fn handle_connection(acceptor: TlsAcceptor, tcp: TcpStream, state: Arc<App
             }
 
             let mut buf = vec![0u8; len];
-            read_half.read_exact(&mut buf).await.context("failed to read DNS query body")?;
+            match timeout(READ_TIMEOUT, read_half.read_exact(&mut buf)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => return Err(err).context("failed to read DNS query body"),
+                Err(_) => bail!("timed out reading DNS query body"),
+            }
 
             let Ok(permit) = Arc::clone(&semaphore).acquire_owned().await else {
                 return Ok(()); // semaphore only closes if the connection is being torn down

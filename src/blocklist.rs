@@ -2,7 +2,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use arc_swap::ArcSwap;
 use rustc_hash::FxHashSet;
 use tokio_util::sync::CancellationToken;
@@ -20,6 +20,12 @@ use crate::util::normalize_name;
 /// concern for a personal/home resolver, but a real one if this is ever
 /// exposed to less-trusted clients.
 pub type BlockSet = Arc<ArcSwap<FxHashSet<String>>>;
+
+/// Hard ceiling on a single blocklist/whitelist URL's response body. The
+/// largest real-world lists in use (e.g. hagezi's `pro.plus`) are a few tens
+/// of MB; this leaves generous headroom while still bounding how much a
+/// single fetch can allocate.
+const MAX_LIST_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Infrastructure hostnames that show up in hosts-format blocklist preambles
 /// (pointing at 0.0.0.0/127.0.0.1) but must never actually be blocked.
@@ -195,8 +201,20 @@ impl BlocklistManager {
     }
 
     async fn fetch_one(&self, url: &str) -> Result<FxHashSet<String>> {
-        let resp = self.http.get(url).send().await?.error_for_status()?;
-        let body = resp.text().await?;
+        let mut resp = self.http.get(url).send().await?.error_for_status()?;
+
+        // Streamed and capped rather than `resp.text()`, which buffers the
+        // whole body regardless of size: a misconfigured, hijacked, or
+        // just-unexpectedly-huge blocklist/whitelist source would otherwise
+        // let a single fetch allocate without bound.
+        let mut body = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            body.extend_from_slice(&chunk);
+            if body.len() as u64 > MAX_LIST_RESPONSE_BYTES {
+                bail!("response from {url} exceeded the {MAX_LIST_RESPONSE_BYTES}-byte limit for a single domain list");
+            }
+        }
+        let body = String::from_utf8(body).with_context(|| format!("response from {url} was not valid UTF-8"))?;
         Ok(parse_list(&body))
     }
 

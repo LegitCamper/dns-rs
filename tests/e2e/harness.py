@@ -19,9 +19,12 @@ protocol layer), and exercises:
   * cache saturation / LRU eviction under a deliberately tiny pool
   * sustained high-concurrency load, sampling RSS to look for leak-shaped
     growth
+  * DoT connection cap + idle-timeout reaping of connections that complete a
+    handshake and then never send a query (the pattern internet background
+    scanners hitting port 853 actually produce)
 
 Usage:
-    uv run tests/e2e/harness.py [smoke|durability|cache|memory|all ...]
+    uv run tests/e2e/harness.py [smoke|durability|cache|memory|dot-limits|all ...]
 
 Requires `cargo build --release` to have been run first, and outbound
 network access to a public DoH/DoT resolver (Cloudflare) for the tests that
@@ -62,6 +65,10 @@ REAL_UPSTREAM_DOH = "https://cloudflare-dns.com/dns-query"
 REAL_UPSTREAM_DOT = "tls://1.1.1.1:853#cloudflare-dns.com"
 
 UPSTREAM_TIMEOUT = 5.0  # must match dns-rs's own UPSTREAM_TIMEOUT constant
+
+# Must match server/dot.rs's MAX_CONCURRENT_CONNECTIONS / IDLE_TIMEOUT.
+DOT_MAX_CONNECTIONS = 512
+DOT_IDLE_TIMEOUT = 120.0
 
 
 # --------------------------------------------------------------------------
@@ -838,6 +845,116 @@ async def scenario_memory_churn(
     return ok
 
 
+async def scenario_dot_connection_limits() -> bool:
+    """Exercises `server/dot.rs`'s `MAX_CONCURRENT_CONNECTIONS`/`IDLE_TIMEOUT`:
+    a connection that completes a TCP+TLS handshake and then never sends a
+    real query, the pattern internet background scanners hitting the DoT
+    port actually produce. Unlike `memory_churn`'s DoT worker, which always
+    sends a complete query and closes promptly, this scenario deliberately
+    never sends one.
+
+    Slow (~2.5 min) by design: it waits out the real `IDLE_TIMEOUT` instead
+    of mocking it, same philosophy as `durability`'s real `UPSTREAM_TIMEOUT`
+    waits.
+    """
+    section("dot: connection cap and idle-timeout reaping")
+    dot_port, doh_port = free_port(), free_port()
+    config = render_config(dot_port=dot_port, doh_port=doh_port, upstream_urls=[REAL_UPSTREAM_DOH, REAL_UPSTREAM_DOT])
+    ok = True
+    ctx = ssl.create_default_context(cafile=str(CERT_PATH))
+
+    async def try_connect():
+        try:
+            return await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", dot_port, ssl=ctx, server_hostname="localhost"), timeout=10.0
+            )
+        except Exception:
+            return None
+
+    async def is_closed(reader: asyncio.StreamReader) -> bool:
+        try:
+            return await asyncio.wait_for(reader.read(1), timeout=0.2) == b""
+        except asyncio.TimeoutError:
+            return False
+        except (ConnectionResetError, asyncio.IncompleteReadError):
+            return True
+
+    with DnsRsServer("dot-connection-limits", config) as server:
+        baseline = await dot_query(dot_port, make_query("example.com", "A"))
+        ok &= check("baseline DoT query succeeds before saturation", baseline.rcode() == dns.rcode.NOERROR)
+
+        # --- Cap enforcement: open well past DOT_MAX_CONNECTIONS at once,
+        # completing the TLS handshake but sending nothing. Connections
+        # beyond the cap get dropped by the server before/without completing
+        # a handshake, which asyncio surfaces as an exception from
+        # open_connection rather than a usable (reader, writer) pair.
+        attempt_count = DOT_MAX_CONNECTIONS + 80
+        results = await asyncio.gather(*(try_connect() for _ in range(attempt_count)))
+        established = [pair for pair in results if pair is not None]
+
+        ok &= check(
+            f"connection cap rejected the excess (established {len(established)}/{attempt_count}, cap {DOT_MAX_CONNECTIONS})",
+            len(established) <= DOT_MAX_CONNECTIONS,
+            detail=f"established={len(established)}",
+        )
+        ok &= check(
+            "cap wasn't so aggressive it rejected everything under it",
+            len(established) > DOT_MAX_CONNECTIONS * 0.8,
+            detail=f"established={len(established)}",
+        )
+        rejected_logged = await server.wait_for_log_count("DoT connection limit reached", minimum=1, timeout=5.0)
+        ok &= check("server logged rejections for the over-cap connections", rejected_logged > 0)
+
+        # Free those slots by disconnecting client-side (detected promptly,
+        # same as any real disconnect) rather than waiting out IDLE_TIMEOUT
+        # here - that's what the next part actually tests.
+        for _reader, writer in established:
+            writer.close()
+        await asyncio.sleep(0.5)
+
+        recovered = await dot_query(dot_port, make_query("example.com", "A"))
+        ok &= check("a slot frees up once the saturating connections disconnect", recovered.rcode() == dns.rcode.NOERROR)
+
+        # --- Idle-timeout reaping: a handful of connections that complete
+        # the TLS handshake and then go silent should get closed by the
+        # server on its own, without the client ever sending anything.
+        stalled_count = 5
+        stalled = await asyncio.gather(*(try_connect() for _ in range(stalled_count)))
+        stalled = [pair for pair in stalled if pair is not None]
+        ok &= check(f"{stalled_count} stalled connections established", len(stalled) == stalled_count)
+
+        mid = await dot_query(dot_port, make_query("example.com", "A"))
+        ok &= check("server stays responsive while connections are idling", mid.rcode() == dns.rcode.NOERROR)
+
+        closed = 0
+        deadline = time.monotonic() + DOT_IDLE_TIMEOUT + 15.0
+        while time.monotonic() < deadline:
+            statuses = await asyncio.gather(*(is_closed(reader) for reader, _writer in stalled))
+            closed = sum(statuses)
+            if closed == len(stalled):
+                break
+            await asyncio.sleep(2.0)
+
+        ok &= check(
+            f"all {len(stalled)} idle connections were closed by the server within IDLE_TIMEOUT+margin",
+            closed == len(stalled),
+            detail=f"closed={closed}/{len(stalled)}",
+        )
+        idle_closed_logged = server.log_count("closing idle DoT connection")
+        ok &= check(
+            "server logged the idle closures", idle_closed_logged >= len(stalled), detail=f"count={idle_closed_logged}"
+        )
+
+        for _reader, writer in stalled:
+            writer.close()
+
+        ok &= check("server survived the whole scenario", server.is_alive())
+        final = await dot_query(dot_port, make_query("example.com", "A"))
+        ok &= check("server still answers real queries after the reaping cycle", final.rcode() == dns.rcode.NOERROR)
+
+    return ok
+
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -848,6 +965,7 @@ SCENARIOS = {
     "cache-saturation": scenario_cache_saturation,
     "durability": scenario_durability,
     "memory": scenario_memory_churn,
+    "dot-limits": scenario_dot_connection_limits,
 }
 
 

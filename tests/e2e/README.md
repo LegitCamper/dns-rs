@@ -23,7 +23,8 @@ uv run tests/e2e/harness.py smoke      # just one scenario
 uv run tests/e2e/harness.py cache durability
 ```
 
-Scenarios: `smoke`, `cache`, `cache-saturation`, `durability`, `memory`.
+Scenarios: `smoke`, `cache`, `cache-saturation`, `durability`, `memory`,
+`dot-limits`.
 
 The memory scenario's duration/concurrency can be overridden:
 
@@ -60,4 +61,16 @@ check failed - see the `Failed checks` list printed at the end.
   genuine upstream misses), sampling the server's RSS throughout. Looks for
   a leak-shaped curve (still climbing hard in the final third of the run)
   vs. the expected warm-up-then-plateau shape. This is a smoke signal from
-  one short burst, not a substitute for a real longevity/soak test.
+  one short burst, not a substitute for a real longevity/soak test. Its DoT
+  worker always sends a complete query and closes promptly - it does not
+  cover a connection that just sits there, which is what `dot-limits` is for.
+- **dot-limits** - the DoT connection cap and idle-timeout reaping
+  (`server/dot.rs`'s `MAX_CONCURRENT_CONNECTIONS`/`IDLE_TIMEOUT`), covering
+  the actual pattern that motivated them: a connection that completes a TLS
+  handshake and then never sends a query, same as internet background
+  scanners hitting port 853 do in practice. Opening well past the cap gets
+  the excess rejected immediately (not queued) while the server keeps
+  serving real queries throughout; a handful of connections left
+  deliberately silent get closed on their own within `IDLE_TIMEOUT`, and the
+  server is confirmed still healthy and responsive afterward. Slow (~2.5
+  min) by design - it waits out the real timeout rather than mocking it.
