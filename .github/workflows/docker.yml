@@ -61,11 +61,9 @@ jobs:
       build-args: |
         CARGO_ARGS=--no-default-features --features serverless
       set-meta-labels: true
-      meta-images: ghcr.io/${{ github.repository }}
-      # Same tag ladder as the default image, suffixed: `latest-serverless`,
-      # `<version>-serverless`, `sha-<sha>-serverless`.
-      meta-flavor: |
-        suffix=-serverless,onlatest=true
+      # Its own package, so the tag ladder matches the default image's exactly
+      # rather than carrying a suffix.
+      meta-images: ghcr.io/${{ github.repository }}-serverless
       meta-tags: |
         type=raw,value=latest,enable={{is_default_branch}}
         type=semver,pattern={{version}}

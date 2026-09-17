@@ -169,6 +169,9 @@ docker build --build-arg 'CARGO_ARGS=--no-default-features --features serverless
 docker run --rm -p 8053:8053 dns-rs-serverless
 ```
 
+CI publishes this one as its own package, on the same tag ladder
+(`ghcr.io/legitcamper/dns-rs-serverless:latest`, `:<git-sha>`, or `:vX.Y.Z`).
+
 Serverless binary ignores image's default `--config` arguments.
 
 There's no `docker-compose.yml` in the repo — the `docker run` invocation
