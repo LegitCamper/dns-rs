@@ -6,6 +6,7 @@ FROM rust:1-slim-bookworm AS builder
 # build (this image is built for linux/amd64 and linux/arm64 - see
 # .github/workflows/docker.yml).
 ARG TARGETARCH
+ARG CARGO_ARGS=
 
 # aws-lc-sys (rustls' crypto backend) builds a vendored C library via cmake.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -38,18 +39,18 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs \
     && if [ "$TARGETARCH" = "amd64" ]; then \
-         cargo sonic --target-cpus=x86-64-v2,x86-64-v3,x86-64-v4 --loader=bundle build --release; \
+         cargo sonic --target-cpus=x86-64-v2,x86-64-v3,x86-64-v4 --loader=bundle build --release $CARGO_ARGS; \
        else \
-         cargo build --release; \
+         cargo build --release $CARGO_ARGS; \
        fi \
     && rm -rf src
 
 COPY src ./src
 RUN touch src/main.rs \
     && if [ "$TARGETARCH" = "amd64" ]; then \
-         cargo sonic --target-cpus=x86-64-v2,x86-64-v3,x86-64-v4 --loader=bundle build --release; \
+         cargo sonic --target-cpus=x86-64-v2,x86-64-v3,x86-64-v4 --loader=bundle build --release $CARGO_ARGS; \
        else \
-         cargo build --release; \
+         cargo build --release $CARGO_ARGS; \
        fi
 
 # Normalize into a fixed path regardless of which branch above ran, so the
@@ -93,7 +94,10 @@ RUN setcap 'cap_net_bind_service=+ep' /usr/local/bin/dns-rs \
 USER dns-rs
 WORKDIR /etc/dns-rs
 
+# Default feature set only: a --features serverless image serves plaintext DoH on
+# ${PORT:-8053} and never binds these.
 EXPOSE 853/tcp 443/tcp
 
 ENTRYPOINT ["/usr/local/bin/dns-rs"]
+# Default build reads this config; serverless builds ignore command-line arguments.
 CMD ["--config", "/etc/dns-rs/config.toml"]

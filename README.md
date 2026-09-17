@@ -1,10 +1,11 @@
 # dns-rs
 
-A small DNS resolver that only speaks encrypted transports — DNS-over-TLS
+A small DNS resolver supporting DNS-over-TLS
 ([RFC 7858](https://www.rfc-editor.org/rfc/rfc7858)) and DNS-over-HTTPS
-([RFC 8484](https://www.rfc-editor.org/rfc/rfc8484)) — with blocklist-based
-adblocking bolted on. There's no plaintext UDP/TCP port 53 listener; every
-query in and every query out is TLS.
+([RFC 8484](https://www.rfc-editor.org/rfc/rfc8484)), with blocklist-based
+adblocking. Default build encrypts client and upstream traffic. Serverless build
+serves plaintext HTTP DoH behind platform TLS termination. Neither build opens
+plaintext UDP/TCP port 53.
 
 This exists to run on a home network or a single small box, in front of
 a couple of clients, not to compete with BIND/Unbound/CoreDNS at scale.
@@ -13,10 +14,9 @@ than its author. Read the code before you point production traffic at it.
 
 ## What it actually does
 
-- **DoT + DoH only.** Clients (or your router) point at this instead of your
-  ISP's resolver or your VPN provider's, and both the query and the answer
-  are encrypted on the wire — no plaintext resolver in the path can see or
-  tamper with lookups.
+- **DoT + DoH by default.** Clients (or your router) point at this instead of
+  your ISP's resolver or VPN provider's. Serverless build exposes plaintext
+  HTTP DoH only to a trusted TLS-terminating platform proxy.
 - **Blocklists**, fetched over HTTP(S) on a configurable interval, parsed as
   hosts-file format, plain domain-per-line, or Adblock Plus network rules
   (`||domain^`). Cosmetic Adblock rules (`##`, `#@#`, `#?#`) are recognized
@@ -81,10 +81,10 @@ tradeoffs on cache sizing and upstream strategy. The broad shape:
 [cache]         # enabled + total byte budget
 ```
 
-You need a TLS certificate and key regardless of deployment method — both
-listeners require one. A self-signed cert is fine for a home network as
-long as your clients are configured to trust it; a real cert (e.g. from a
-DNS-validated ACME issuance) works too if the resolver has a public name.
+Default build needs a TLS certificate and key for both listeners. A self-signed
+certificate works when clients trust it; a DNS-validated ACME certificate works
+when resolver has a public name. Serverless build needs no certificate or config
+file because platform terminates TLS and settings come from environment.
 
 ## Running it
 
@@ -96,8 +96,37 @@ cargo build --release
 ```
 
 Binding to 853/443 without root requires the `cap_net_bind_service`
-capability on the binary, or just run it as root, or remap to high ports
-in `config.toml` for local testing.
+capability on the binary, or remap to high ports in `config.toml`.
+
+### Serverless container
+
+Build plaintext DoH profile and start without arguments, files, keys, or certificates:
+
+```sh
+cargo build --release --no-default-features --features serverless
+./target/release/dns-rs
+```
+
+It listens on `0.0.0.0:${PORT:-8053}`. `GET /healthz` returns `ok`. Do not expose
+this plaintext listener directly to untrusted networks; place it behind platform
+TLS termination.
+
+Optional environment settings:
+
+| Variable | Default |
+|---|---|
+| `PORT` / `DNSRS_DOH_PORT` | `8053` (`PORT` wins) |
+| `DNSRS_BIND_ADDRESS` | `0.0.0.0` |
+| `DNSRS_UPSTREAM_URLS` | `https://cloudflare-dns.com/dns-query` |
+| `DNSRS_UPSTREAM_STRATEGY` | `sequential` |
+| `DNSRS_BLOCKLIST_URLS`, `DNSRS_BLOCKLIST_DOMAINS` | empty comma-separated lists |
+| `DNSRS_WHITELIST_URLS`, `DNSRS_WHITELIST_DOMAINS` | empty comma-separated lists |
+| `DNSRS_BLOCKLIST_REFRESH_SECS`, `DNSRS_WHITELIST_REFRESH_SECS` | `43200` |
+| `DNSRS_BLOCK_MODE`, `DNSRS_SINKHOLE_IP` | `nxdomain`, `0.0.0.0` |
+| `DNSRS_STATIC_HOSTS` | empty; format `name=ip,name2=ip2` |
+| `DNSRS_CACHE_ENABLED` | `true` |
+| `DNSRS_CACHE_MAX_SIZE_BYTES` | ¼ of the cgroup memory limit, clamped to 1–64 MiB (64 MiB when no limit is discoverable); ceiling 1 GiB |
+| `DNSRS_DEFAULT_TTL` | `300` |
 
 ### Docker
 
@@ -131,6 +160,16 @@ The entrypoint defaults to `--config /etc/dns-rs/config.toml`, so your
 mounted config's `tls_cert`/`tls_key` paths should point at wherever you
 mounted the cert/key inside the container (`/etc/dns-rs/fullchain.pem` and
 `/etc/dns-rs/privkey.pem` above, to match).
+
+Build a zero-config serverless image with:
+
+```sh
+docker build --build-arg 'CARGO_ARGS=--no-default-features --features serverless' \
+  -t dns-rs-serverless .
+docker run --rm -p 8053:8053 dns-rs-serverless
+```
+
+Serverless binary ignores image's default `--config` arguments.
 
 There's no `docker-compose.yml` in the repo — the `docker run` invocation
 above is the whole setup; wrap it in compose/systemd/whatever you already

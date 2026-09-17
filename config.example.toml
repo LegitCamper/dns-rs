@@ -1,5 +1,6 @@
-# Example dns-rs configuration.
+# Example config for default DoT + TLS DoH build.
 # Copy to config.toml (or pass --config <path>) and adjust for your deployment.
+# Serverless build uses environment variables instead; see README.md.
 
 [server]
 # Binds to all interfaces by default. Standard DoT/DoH ports (853/443) require
@@ -81,4 +82,4 @@ enabled = true
 # case). Nothing about serving a request grows, shrinks, or reallocates this
 # pool. If it fills up, expired entries are evicted first, then
 # least-recently-used ones, until the next response fits.
-max_size_bytes = 67108864  # 64 MiB
+max_size_bytes = 67108864  # 64 MiB (hard ceiling: 1 GiB)

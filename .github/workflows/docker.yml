@@ -37,3 +37,41 @@ jobs:
         - registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+  serverless:
+    # Same Dockerfile, different cargo feature set: plaintext DoH behind a
+    # platform TLS terminator, env-var config, no DoT. A separate image rather
+    # than a runtime flag because the feature guards in src/main.rs make
+    # "plaintext on the TLS ports" unrepresentable at compile time.
+    uses: docker/github-builder/.github/workflows/build.yml@v1
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    with:
+      job-name-prefix: serverless
+      output: image
+      push: ${{ github.event_name != 'pull_request' }}
+      platforms: linux/amd64,linux/arm64
+      cache: true
+      cache-mode: max
+      # Distinct scope: these layers are a different cargo feature set, so
+      # sharing the default build's cache would thrash it.
+      cache-scope: serverless
+      build-args: |
+        CARGO_ARGS=--no-default-features --features serverless
+      set-meta-labels: true
+      meta-images: ghcr.io/${{ github.repository }}
+      # Same tag ladder as the default image, suffixed: `latest-serverless`,
+      # `<version>-serverless`, `sha-<sha>-serverless`.
+      meta-flavor: |
+        suffix=-serverless,onlatest=true
+      meta-tags: |
+        type=raw,value=latest,enable={{is_default_branch}}
+        type=semver,pattern={{version}}
+        type=sha
+    secrets:
+      registry-auths: |
+        - registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
