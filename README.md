@@ -97,7 +97,7 @@ TLS of its own. It is only safe behind a TLS-terminating proxy.
 | `PORT` / `DNSRS_DOH_PORT` | `8053` (`PORT` wins) |
 | `DNSRS_BIND_ADDRESS` | `0.0.0.0` |
 | `DNSRS_UPSTREAM_URLS` | `https://cloudflare-dns.com/dns-query` |
-| `DNSRS_UPSTREAM_STRATEGY` | `sequential` |
+| `DNSRS_UPSTREAM_STRATEGY` | `sequential` (`sequential`, `hedged`, or `race`) |
 | `DNSRS_BLOCKLIST_URLS`, `DNSRS_BLOCKLIST_DOMAINS` | empty comma-separated lists |
 | `DNSRS_WHITELIST_URLS`, `DNSRS_WHITELIST_DOMAINS` | empty comma-separated lists |
 | `DNSRS_BLOCKLIST_REFRESH_SECS`, `DNSRS_WHITELIST_REFRESH_SECS` | `43200` |

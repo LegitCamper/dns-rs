@@ -180,6 +180,10 @@ pub enum UpstreamStrategy {
     /// Try each upstream in order, falling back on failure or timeout.
     #[default]
     Sequential,
+    /// Start upstreams in order with a short delay between each, returning
+    /// the first success. Usually as fast as racing every upstream while
+    /// avoiding duplicate traffic when the preferred one responds promptly.
+    Hedged,
     /// Query every upstream at once, use whichever answers first.
     Race,
 }

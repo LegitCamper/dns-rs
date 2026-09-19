@@ -22,6 +22,11 @@ use crate::config::{UpstreamConfig, UpstreamStrategy};
 
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the preferred upstream gets to answer before a hedged query is
+/// sent to the next one. Healthy nearby resolvers finish comfortably within
+/// this; a slow one no longer owns the entire client-visible critical path.
+const HEDGE_DELAY: Duration = Duration::from_millis(25);
+
 /// How often an idle upstream DoH connection sends an HTTP/2 PING. Well
 /// under the ~30-60s public resolvers take to reap an idle connection, so
 /// the connection stays established between query bursts.
@@ -176,6 +181,9 @@ impl<T: Upstream + ?Sized> Upstream for Arc<T> {
 pub enum Strategy {
     /// Try each upstream in order, falling back on failure or timeout.
     Sequential,
+    /// Start in order with `HEDGE_DELAY` between attempts; use the first
+    /// successful answer.
+    Hedged,
     /// Query every upstream at once, use whichever answers first.
     Race,
 }
@@ -184,6 +192,7 @@ impl From<UpstreamStrategy> for Strategy {
     fn from(value: UpstreamStrategy) -> Self {
         match value {
             UpstreamStrategy::Sequential => Self::Sequential,
+            UpstreamStrategy::Hedged => Self::Hedged,
             UpstreamStrategy::Race => Self::Race,
         }
     }
@@ -245,6 +254,7 @@ impl<U: Upstream> MultiUpstream<U> {
         let original_id = query.metadata.id;
         let mut response = match self.strategy {
             Strategy::Sequential => self.resolve_sequential(query).await,
+            Strategy::Hedged => self.resolve_hedged(query).await,
             Strategy::Race => self.resolve_race(query).await,
         }?;
         response.metadata.id = original_id;
@@ -284,6 +294,38 @@ impl<U: Upstream> MultiUpstream<U> {
         }
 
         Err(last_err.unwrap_or_else(|| anyhow!("no upstream resolvers configured")))
+    }
+
+    /// Gives the preferred upstream a short head start, then introduces each
+    /// fallback in order. Unlike `Race`, the common case sends only one
+    /// request; unlike `Sequential`, one slow-but-not-failed upstream cannot
+    /// consume the whole client-visible timeout before a healthy fallback is
+    /// tried.
+    async fn resolve_hedged(&self, query: &Message) -> Result<Message> {
+        if self.upstreams.is_empty() {
+            bail!("no upstream resolvers configured");
+        }
+
+        let futures = self.upstreams.iter().enumerate().map(|(index, upstream)| {
+            let fut = async move {
+                if index > 0 {
+                    tokio::time::sleep(HEDGE_DELAY * index as u32).await;
+                }
+                match upstream.resolve(query).await {
+                    Ok(response) => Ok(response),
+                    Err(err) => {
+                        warn!(upstream = upstream.label(), error = format!("{err:#}"), "upstream query failed (hedged)");
+                        Err(err)
+                    }
+                }
+            };
+            Box::pin(fut) as Pin<Box<dyn Future<Output = Result<Message>> + Send + '_>>
+        });
+
+        match timeout(UPSTREAM_TIMEOUT, select_ok(futures)).await {
+            Ok(result) => result.map(|(response, _still_running)| response),
+            Err(_) => bail!("all hedged upstream queries timed out"),
+        }
     }
 
     async fn resolve_race(&self, query: &Message) -> Result<Message> {
@@ -571,6 +613,41 @@ mod tests {
 
         let err = pool.resolve(&test_query()).await.unwrap_err();
         assert!(err.to_string().contains('b'), "should surface the last upstream's error");
+    }
+
+    #[tokio::test]
+    async fn hedged_does_not_touch_fallback_when_preferred_answers_within_head_start() {
+        let preferred = FakeUpstream::answering("preferred", "1.1.1.1".parse().unwrap());
+        let fallback = FakeUpstream::answering("fallback", "9.9.9.9".parse().unwrap());
+        let pool = MultiUpstream::new(vec![preferred, fallback], Strategy::Hedged);
+
+        let response = pool.resolve(&test_query()).await.unwrap();
+
+        assert_eq!(only_answer_ip(&response), "1.1.1.1".parse::<std::net::Ipv4Addr>().unwrap());
+        assert_eq!(pool.upstreams[0].calls(), 1);
+        assert_eq!(
+            pool.upstreams[1].calls(),
+            0,
+            "a prompt preferred answer must cancel the delayed fallback before it sends duplicate upstream traffic"
+        );
+    }
+
+    #[tokio::test]
+    async fn hedged_uses_fallback_without_waiting_for_slow_preferred() {
+        let preferred = FakeUpstream::answering("preferred", "1.1.1.1".parse().unwrap()).with_delay(StdDuration::from_millis(200));
+        let fallback = FakeUpstream::answering("fallback", "9.9.9.9".parse().unwrap());
+        let pool = MultiUpstream::new(vec![preferred, fallback], Strategy::Hedged);
+
+        let started = Instant::now();
+        let response = pool.resolve(&test_query()).await.unwrap();
+
+        assert_eq!(only_answer_ip(&response), "9.9.9.9".parse::<std::net::Ipv4Addr>().unwrap());
+        assert!(
+            started.elapsed() < StdDuration::from_millis(150),
+            "fallback should win shortly after the hedge delay rather than waiting 200ms for the preferred upstream"
+        );
+        assert_eq!(pool.upstreams[0].calls(), 1);
+        assert_eq!(pool.upstreams[1].calls(), 1);
     }
 
     #[tokio::test]

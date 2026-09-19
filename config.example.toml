@@ -56,6 +56,9 @@ domains = [
 # strategy:
 #   "sequential" - try them in order, falling back to the next on failure.
 #                  One request in flight per query.
+#   "hedged"    - start with the first upstream, then start each fallback
+#                  after 25ms if no answer has arrived. Usually race-like
+#                  latency without sending every query to every provider.
 #   "race"       - query every upstream at once, use whichever answers
 #                  first. Lower worst-case latency and more resilient to a
 #                  single flaky upstream, at the cost of every query
