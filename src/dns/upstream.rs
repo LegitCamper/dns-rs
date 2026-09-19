@@ -7,14 +7,15 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use futures_util::future::select_ok;
-use hickory_proto::op::Message;
+use hickory_proto::op::{Message, Query};
+use hickory_proto::rr::{Name, RecordType};
 use rustls_pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::config::{UpstreamConfig, UpstreamStrategy};
 
@@ -170,6 +171,44 @@ impl From<UpstreamStrategy> for Strategy {
 pub struct MultiUpstream<U> {
     upstreams: Vec<U>,
     strategy: Strategy,
+}
+
+impl SingleUpstream {
+    /// Establishes this upstream's connection before any client needs it, so
+    /// the first real query doesn't pay the TCP+TLS handshake itself.
+    ///
+    /// A probe query rather than a bare dial: reqwest has no connect-only
+    /// API, so for DoH the only way to get a pooled connection established
+    /// is to actually send something. `. NS` is the smallest universally-
+    /// answered query there is, and using the same path for DoT keeps one
+    /// code path instead of two.
+    async fn warm(&self) -> Result<()> {
+        let mut probe = Message::query();
+        probe.add_query(Query::query(Name::root(), RecordType::NS));
+        self.resolve(&probe).await.map(|_| ())
+    }
+}
+
+impl MultiUpstream<SingleUpstream> {
+    /// Dials every upstream up front so the first client query doesn't pay a
+    /// handshake that a background task could have paid instead.
+    ///
+    /// Failures are logged, not returned: an upstream being unreachable at
+    /// startup is exactly the case the fallback/race logic exists to handle,
+    /// and it must not keep the server from coming up.
+    pub async fn warm_all(&self) {
+        futures_util::future::join_all(self.upstreams.iter().map(|upstream| async move {
+            match upstream.warm().await {
+                Ok(()) => debug!(upstream = upstream.label(), "upstream connection warmed"),
+                Err(err) => warn!(
+                    upstream = upstream.label(),
+                    error = format!("{err:#}"),
+                    "failed to warm upstream connection, leaving it to the first query"
+                ),
+            }
+        }))
+        .await;
+    }
 }
 
 impl<U: Upstream> MultiUpstream<U> {
@@ -622,6 +661,51 @@ mod tests {
         // the race to check in, not dial a fourth.
         query_dot(&pool, &wire).await.unwrap();
         assert_eq!(accepts.load(Ordering::SeqCst), after_burst, "the idle slot should still hold one connection from the burst");
+    }
+
+    #[tokio::test]
+    async fn warm_all_establishes_a_connection_before_any_client_query() {
+        let tls = test_tls::generate("localhost");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(mock_dot_server(listener, tls.acceptor, Arc::clone(&accepts), false));
+
+        let upstream = SingleUpstream {
+            label: "dot://test".to_string(),
+            backend: Backend::Dot(Box::new(DotPool::new("127.0.0.1".to_string(), addr.port(), tls.server_name, tls.connector))),
+        };
+        let pool = MultiUpstream::new(vec![upstream], Strategy::Sequential);
+
+        pool.warm_all().await;
+        assert_eq!(accepts.load(Ordering::SeqCst), 1, "warming should have dialed the upstream");
+
+        // The warmed connection must be parked for reuse, not left dangling:
+        // a real query after warming should not dial a second time.
+        pool.resolve(&test_query()).await.unwrap();
+        assert_eq!(accepts.load(Ordering::SeqCst), 1, "the first real query should reuse the warmed connection, not redial");
+    }
+
+    #[tokio::test]
+    async fn warm_all_survives_an_unreachable_upstream() {
+        // Port 1 on loopback: nothing listening, so the dial fails fast.
+        let unreachable = SingleUpstream {
+            label: "dot://unreachable".to_string(),
+            backend: Backend::Dot(Box::new(DotPool::new(
+                "127.0.0.1".to_string(),
+                1,
+                ServerName::try_from("localhost").unwrap(),
+                TlsConnector::from(Arc::new(
+                    rustls::ClientConfig::builder().with_root_certificates(rustls::RootCertStore::empty()).with_no_client_auth(),
+                )),
+            ))),
+        };
+        let pool = MultiUpstream::new(vec![unreachable], Strategy::Sequential);
+
+        // Must return rather than propagate: an upstream that's down at
+        // startup is exactly what the fallback logic exists for, and it
+        // must never keep the server from coming up.
+        pool.warm_all().await;
     }
 
     #[cfg(feature = "doh-tls")]

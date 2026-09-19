@@ -160,6 +160,16 @@ async fn run_configured() -> Result<()> {
 
 async fn spawn_listeners(config: &Config, shutdown: CancellationToken) -> Result<Vec<Listener>> {
     let state = Arc::new(AppState::build(config, shutdown.clone()).await?);
+
+    // Dial every upstream now so the first client query doesn't pay a
+    // TCP+TLS handshake that a background task could have paid instead.
+    // Not awaited: startup shouldn't block on a round trip to a public
+    // resolver, and the listeners must come up whether or not it succeeds.
+    tokio::spawn({
+        let state = Arc::clone(&state);
+        async move { state.upstreams.warm_all().await }
+    });
+
     let mut listeners = Vec::new();
 
     #[cfg(feature = "dot")]
