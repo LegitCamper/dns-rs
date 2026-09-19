@@ -1,75 +1,50 @@
 # dns-rs
 
-A small DNS resolver supporting DNS-over-TLS
-([RFC 7858](https://www.rfc-editor.org/rfc/rfc7858)) and DNS-over-HTTPS
-([RFC 8484](https://www.rfc-editor.org/rfc/rfc8484)), with blocklist-based
-adblocking. Default build encrypts client and upstream traffic. Serverless build
-serves plaintext HTTP DoH behind platform TLS termination. Neither build opens
-plaintext UDP/TCP port 53.
+Self-hosted, ad-blocking DNS resolver that only speaks **encrypted** DNS —
+DNS-over-TLS (DoT) and DNS-over-HTTPS (DoH).
 
-This exists to run on a home network or a single small box, in front of
-a couple of clients, not to compete with BIND/Unbound/CoreDNS at scale.
-It hasn't been fuzzed, load-tested, or security-reviewed by anyone other
-than its author. Read the code before you point production traffic at it.
+Point your router or devices at it instead of your ISP's resolver. Ads and
+trackers get dropped before they resolve, and the queries that do go upstream
+are encrypted end to end.
 
-## What it actually does
+Written in Rust: a single stripped binary, no runtime, no GC, no interpreter.
+It idles at a few MB of RAM and answers cache hits without allocating, so it's
+happy on a Raspberry Pi, an old NUC, or a free serverless tier.
 
-- **DoT + DoH by default.** Clients (or your router) point at this instead of
-  your ISP's resolver or VPN provider's. Serverless build exposes plaintext
-  HTTP DoH only to a trusted TLS-terminating platform proxy.
-- **Blocklists**, fetched over HTTP(S) on a configurable interval, parsed as
-  hosts-file format, plain domain-per-line, or Adblock Plus network rules
-  (`||domain^`). Cosmetic Adblock rules (`##`, `#@#`, `#?#`) are recognized
-  and deliberately ignored rather than mis-parsed into blocked domains — a
-  bug in an earlier version of the parser did the opposite and NXDOMAIN'd
-  half the web.
-- **A whitelist** of exact domains that override every blocklist, checked
-  every time the merged list is rebuilt so a background refresh can't
-  silently re-block something you carved out.
-- **Static host overrides** — your own domain → IP entries, checked before
-  the blocklist and never forwarded upstream.
-- **Blocking modes**: NXDOMAIN (domain doesn't exist) or sinkhole (resolves
-  to an IP you configure, the classic Pi-hole style).
-- **A response cache** sized in bytes, not entry count. It's one
-  fixed-size arena allocated once at startup; individual responses are
-  suballocated out of it via a first-fit allocator with free-block
-  coalescing, so a cache full of tiny NXDOMAINs and a cache full of large
-  TXT records both just use however many bytes they actually need. When
-  it's full, expired entries are evicted first, then least-recently-used
-  ones. A background sweeper also reclaims expired entries on a timer so a
-  live request doesn't usually have to do that cleanup itself.
-- **RFC 2308 negative caching** — NXDOMAIN and NODATA responses are cached
-  too, when the upstream provides an SOA record to bound how long that's
-  safe to assume.
-- **Two upstream strategies**: sequential fallback (try each configured
-  upstream in order) or race (query all of them, take whichever answers
-  first). Duplicate in-flight queries for the same name/type are coalesced
-  into a single upstream request.
-- **Hot config reload** — the config file is polled for changes and a
-  changed file is reloaded without dropping the process or existing
-  connections (in-flight requests get a grace period before the old
-  listeners are torn down).
+## What you get
 
-## What it doesn't do
+- **DoT on 853 and DoH on 443**, both TLS-terminated by the resolver itself.
+  Nothing listens on plaintext port 53.
+- **Blocklists** fetched over HTTPS on a schedule you set. Hosts-file format,
+  plain domain-per-line, and Adblock Plus network rules (`||domain^`) all work
+  — point it at StevenBlack/hosts and you're done.
+- **Whitelist** of exact domains that override every blocklist, re-applied on
+  every refresh so a background update can't re-block something you carved out.
+- **Static hosts** — `nas.home = 192.168.1.10` style overrides, answered
+  locally, never forwarded upstream.
+- **Block mode**: NXDOMAIN, or sinkhole to an IP you pick (Pi-hole style).
+- **Fast cache** with a byte budget instead of an entry count, so tiny NXDOMAIN
+  answers and fat TXT records each use only what they need. Failures (NXDOMAIN
+  / NODATA) get cached too, when upstream says how long that's safe.
+- **Multiple upstreams**: try them in order, or race all of them and take the
+  first answer. Duplicate in-flight queries collapse into one upstream request.
+- **Hot config reload** — edit `config.toml` and it picks up the change without
+  restarting or dropping connections.
 
-- No plaintext DNS on port 53 (UDP or TCP). If something on your network
-  only speaks classic DNS, it needs a client-side proxy (e.g. `stubby`,
-  `dnscrypt-proxy`) in front of this, not the other way around.
-- No DNSSEC validation.
-- No IPv6 in synthesized answers (static hosts and sinkhole mode only ever
-  produce `A` records; `AAAA` queries against those names get NOERROR/NODATA,
-  which still blocks them, just without a synthesized IPv6 sinkhole address).
-- Single process, single cache, no clustering or shared state between
-  instances — if you want redundancy, run two independent instances behind
-  DNS-level failover, not two instances sharing state.
-- No query ACLs / authentication. Anything that can reach the configured
-  ports can query it. Firewall it like you would any other internal service.
+## Quick start (Docker)
 
-## Configuration
+```sh
+docker run -d \
+  --name dns-rs \
+  -p 853:853 \
+  -p 443:443 \
+  -v /path/to/config.toml:/etc/dns-rs/config.toml:ro \
+  -v /path/to/fullchain.pem:/etc/dns-rs/fullchain.pem:ro \
+  -v /path/to/privkey.pem:/etc/dns-rs/privkey.pem:ro \
+  ghcr.io/legitcamper/dns-rs:latest
+```
 
-Copy `config.example.toml` to `config.toml` (or point `--config` at wherever
-you keep it) and edit it — every option is commented there, including the
-tradeoffs on cache sizing and upstream strategy. The broad shape:
+Start from `config.example.toml` — every option is commented. Shape of it:
 
 ```toml
 [server]        # bind address, DoT/DoH ports, TLS cert/key paths
@@ -81,37 +56,41 @@ tradeoffs on cache sizing and upstream strategy. The broad shape:
 [cache]         # enabled + total byte budget
 ```
 
-Default build needs a TLS certificate and key for both listeners. A self-signed
-certificate works when clients trust it; a DNS-validated ACME certificate works
-when resolver has a public name. Serverless build needs no certificate or config
-file because platform terminates TLS and settings come from environment.
+The image runs as an unprivileged user with `cap_net_bind_service` on the
+binary, so binding 853/443 needs no `--privileged` and no `-u root`. Your
+config's `tls_cert`/`tls_key` should point at the paths you mounted inside the
+container. Tags: `:latest`, `:<git-sha>`, `:vX.Y.Z`.
 
-## Running it
+You need a TLS certificate: self-signed is fine if you can trust it on your
+clients, or use a DNS-validated ACME cert if the resolver has a public name.
 
-### From source
+## From source
 
 ```sh
 cargo build --release
 ./target/release/dns-rs --config /path/to/config.toml
 ```
 
-Binding to 853/443 without root requires the `cap_net_bind_service`
-capability on the binary, or remap to high ports in `config.toml`.
+Binding 853/443 without root needs `cap_net_bind_service` on the binary, or
+just use high ports in `config.toml`.
 
-### Serverless container
+## Serverless (Fly, Cloud Run, etc.)
 
-Build plaintext DoH profile and start without arguments, files, keys, or certificates:
+A separate build that serves **plaintext HTTP DoH** behind a platform that
+terminates TLS for you. No certificate, no config file — everything comes from
+environment variables.
 
 ```sh
-cargo build --release --no-default-features --features serverless
-./target/release/dns-rs
+docker run --rm -p 8053:8053 ghcr.io/legitcamper/dns-rs-serverless:latest
 ```
 
-It listens on `0.0.0.0:${PORT:-8053}`. `GET /healthz` returns `ok`. Do not expose
-this plaintext listener directly to untrusted networks; place it behind platform
-TLS termination.
+Listens on `0.0.0.0:${PORT:-8053}`; `GET /healthz` returns `ok`.
 
-Optional environment settings:
+**Do not expose this listener to an untrusted network directly** — it has no
+TLS of its own. It is only safe behind a TLS-terminating proxy.
+
+<details>
+<summary>Environment variables</summary>
 
 | Variable | Default |
 |---|---|
@@ -128,55 +107,30 @@ Optional environment settings:
 | `DNSRS_CACHE_MAX_SIZE_BYTES` | ¼ of the cgroup memory limit, clamped to 1–64 MiB (64 MiB when no limit is discoverable); ceiling 1 GiB |
 | `DNSRS_DEFAULT_TTL` | `300` |
 
-### Docker
-
-A multi-stage `Dockerfile` is included; the runtime image runs as an
-unprivileged user with `cap_net_bind_service` set on the binary via
-`setcap`, so it doesn't need `--privileged` or `-u root` to bind 853/443.
-
-Build it yourself:
-
-```sh
-docker build -t dns-rs .
-```
-
-Or pull the image CI publishes to GHCR on every push to `main` and on
-version tags (`ghcr.io/legitcamper/dns-rs:latest`, `:<git-sha>`, or `:vX.Y.Z`).
-
-Run it, mounting your config and TLS material read-only:
-
-```sh
-docker run -d \
-  --name dns-rs \
-  -p 853:853 \
-  -p 443:443 \
-  -v /path/to/config.toml:/etc/dns-rs/config.toml:ro \
-  -v /path/to/fullchain.pem:/etc/dns-rs/fullchain.pem:ro \
-  -v /path/to/privkey.pem:/etc/dns-rs/privkey.pem:ro \
-  ghcr.io/legitcamper/dns-rs:latest
-```
-
-The entrypoint defaults to `--config /etc/dns-rs/config.toml`, so your
-mounted config's `tls_cert`/`tls_key` paths should point at wherever you
-mounted the cert/key inside the container (`/etc/dns-rs/fullchain.pem` and
-`/etc/dns-rs/privkey.pem` above, to match).
-
-Build a zero-config serverless image with:
+Build it yourself with:
 
 ```sh
 docker build --build-arg 'CARGO_ARGS=--no-default-features --features serverless' \
   -t dns-rs-serverless .
-docker run --rm -p 8053:8053 dns-rs-serverless
 ```
 
-CI publishes this one as its own package, on the same tag ladder
-(`ghcr.io/legitcamper/dns-rs-serverless:latest`, `:<git-sha>`, or `:vX.Y.Z`).
+</details>
 
-Serverless binary ignores image's default `--config` arguments.
+## Know before you deploy
 
-There's no `docker-compose.yml` in the repo — the `docker run` invocation
-above is the whole setup; wrap it in compose/systemd/whatever you already
-use to manage containers if you want it supervised.
+- **No plaintext DNS on port 53.** Devices that only speak classic DNS need a
+  client-side proxy (`stubby`, `dnscrypt-proxy`) in front of this.
+- **No DNSSEC validation.**
+- **No IPv6 in synthesized answers** — static hosts and sinkhole mode produce
+  `A` records only. `AAAA` queries against those names get NOERROR/NODATA,
+  which still blocks them, just without a v6 sinkhole address.
+- **No ACLs or auth.** Anything that can reach the ports can query it. Firewall
+  it like any other internal service.
+- **Single instance, no clustering.** For redundancy, run two independent
+  instances behind DNS-level failover, not two sharing state.
+- This is a home-network / single-box resolver, not a BIND/Unbound/CoreDNS
+  replacement at scale. It has not been fuzzed, load-tested, or security
+  reviewed by anyone but its author.
 
 ## Development
 
@@ -186,4 +140,4 @@ cargo clippy --all-targets
 ```
 
 Tests use fake upstreams (no real network/TLS) to exercise fallback, race,
-caching, and negative-caching behavior directly — see `dns::test_support`.
+caching, and negative-caching behavior — see `dns::test_support`.
