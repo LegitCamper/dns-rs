@@ -367,10 +367,16 @@ async def dot_query_raw(port: int, raw: bytes, timeout: float = 8.0) -> bytes:
         writer.close()
 
 
-async def doh_query(port: int, query: dns.message.Message, client: httpx.AsyncClient, timeout: float = 8.0) -> dns.message.Message:
+async def doh_query(
+    port: int,
+    query: dns.message.Message,
+    client: httpx.AsyncClient,
+    timeout: float = 8.0,
+    path: str = "/dns-query",
+) -> dns.message.Message:
     wire = query.to_wire()
     resp = await client.post(
-        f"https://localhost:{port}/dns-query",
+        f"https://localhost:{port}{path}",
         content=wire,
         headers={"content-type": "application/dns-message", "accept": "application/dns-message"},
         timeout=timeout,
@@ -410,6 +416,14 @@ async def scenario_smoke() -> bool:
 
             # Blocklist (DoH transport this time).
             async with httpx.AsyncClient(verify=str(CERT_PATH)) as client:
+                for path in ("/", "/electric-boogoloo", "/dns-query"):
+                    q = make_query("nas.home", "A")
+                    resp = await doh_query(doh_port, q, client, path=path)
+                    ok &= check(
+                        f"static host resolves via DoH at {path}",
+                        resp.rcode() == dns.rcode.NOERROR and str(resp.answer[0][0]) == "192.168.1.10",
+                    )
+
                 q = make_query("blocked.test.invalid", "A")
                 resp = await doh_query(doh_port, q, client)
                 ok &= check("blocklisted domain returns NXDOMAIN via DoH", resp.rcode() == dns.rcode.NXDOMAIN)

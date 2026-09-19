@@ -54,11 +54,12 @@ fn app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/dns-query", get(handle_get).post(handle_post))
         .route("/healthz", get(|| async { "ok" }))
+        .fallback(get(handle_get).post(handle_post))
         .with_state(state)
 }
 
-/// RFC 8484 DNS-over-HTTPS listener on `/dns-query`, supporting both the GET
-/// form (`?dns=<base64url>`) and the POST form (raw wire bytes as the body).
+/// RFC 8484 DNS-over-HTTPS listener on every path except `/healthz`, supporting
+/// both the GET form (`?dns=<base64url>`) and POST form (raw wire bytes as body).
 /// axum-server negotiates HTTP/1.1 or h2 over ALPN automatically.
 #[cfg(feature = "doh-tls")]
 pub async fn serve(
