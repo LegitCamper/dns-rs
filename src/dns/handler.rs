@@ -120,11 +120,19 @@ async fn fetch_from_upstream<U: Upstream>(
                     debug!(%qname, ?qtype, ttl, "caching upstream response");
                     state.cache.insert(qname, qtype, qclass, ttl, wire.clone());
                 }
-                None => debug!(%qname, ?qtype, "not caching (no TTL-bearing answers, and no SOA to bound a negative cache)"),
+                None => {
+                    // A failed/non-cacheable background refresh must not burn
+                    // this entry's only opportunity to try again before it
+                    // expires. On an ordinary cache miss the key isn't
+                    // present, so this is a harmless no-op.
+                    state.cache.release_refresh_claim(&qname, qtype, qclass);
+                    debug!(%qname, ?qtype, "not caching (no TTL-bearing answers, and no SOA to bound a negative cache)");
+                }
             }
             wire
         }
         Err(err) => {
+            state.cache.release_refresh_claim(&qname, qtype, qclass);
             warn!(error = format!("{err:#}"), qname = %qname, "upstream resolution failed");
             encode_or_servfail(&Message::error_msg(id, op_code, ResponseCode::ServFail), id, op_code)
         }

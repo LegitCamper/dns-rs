@@ -144,6 +144,18 @@ impl ResponseCache {
         Some((state.pool[offset..offset + len].to_vec(), should_refresh))
     }
 
+    /// Releases a claimed refresh after its upstream fetch failed, letting a
+    /// later cache hit try again instead of forcing the entry to expire and
+    /// put the full retry round trip back on a client's critical path.
+    pub fn release_refresh_claim(&self, name: &str, record_type: RecordType, dns_class: DNSClass) {
+        let Some(key) = InlineName::new(name).map(|name| (record_type, dns_class, name)) else {
+            return;
+        };
+        if let Some(meta) = self.state.lock().unwrap().entries.get_mut(&key) {
+            meta.refresh_claimed = false;
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn set_remaining_ttl_for_test(
         &self,
@@ -445,6 +457,21 @@ mod tests {
         });
 
         assert_eq!(claims, 1, "the refresh claim must be set atomically under the cache mutex");
+    }
+
+    #[test]
+    fn failed_refresh_claim_can_be_released_and_claimed_again() {
+        let cache = ResponseCache::new(true, 4096);
+        cache.insert("retry.example.".to_string(), A, IN, 100, vec![1]);
+        cache.set_remaining_ttl_for_test("retry.example.", A, IN, Duration::from_secs(9));
+        assert!(cache.get("retry.example.", A, IN).unwrap().1, "first refresh attempt should claim the entry");
+
+        cache.release_refresh_claim("retry.example.", A, IN);
+
+        assert!(
+            cache.get("retry.example.", A, IN).unwrap().1,
+            "a failed refresh must release its claim so a later hit can retry before expiry"
+        );
     }
 
     #[test]
