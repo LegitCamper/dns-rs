@@ -38,6 +38,18 @@ pub trait Upstream: Send + Sync {
     fn resolve(&self, query: &Message) -> impl Future<Output = Result<Message>> + Send;
 }
 
+/// How many idle DoT connections are kept warm per upstream. A single slot
+/// meant any burst of concurrent queries past the first had to dial its own
+/// connection and then throw it away on checkin, paying a full TCP+TLS
+/// handshake (two round trips to a public resolver, so tens of
+/// milliseconds) on every query in the burst. Keeping a few lets a burst
+/// reuse what the previous burst established.
+///
+/// Small on purpose: public DoT resolvers close idle connections within
+/// seconds, so connections beyond the working set go stale before they're
+/// reused and cost a reconnect anyway.
+const MAX_IDLE_DOT_CONNECTIONS: usize = 8;
+
 /// Persistent, reusable DoT connection to one upstream, avoiding a fresh
 /// TCP+TLS handshake per query (RFC 7858). No in-flight multiplexing — a
 /// checked-out connection serves exactly one query before returning.
@@ -46,12 +58,11 @@ struct DotPool {
     port: u16,
     server_name: ServerName<'static>,
     connector: TlsConnector,
-    /// At most one idle connection is kept warm for reuse. Concurrent
-    /// queries beyond that each dial their own and it's closed (not kept)
-    /// on checkin — public DoT resolvers close idle connections quickly
-    /// (Cloudflare observed at ~5-10s), so a deeper idle pool barely
-    /// improves the steady-state reuse rate and isn't worth the complexity.
-    idle: Mutex<Option<TlsStream<TcpStream>>>,
+    /// Up to `MAX_IDLE_DOT_CONNECTIONS` are kept warm for reuse. Used as a
+    /// stack (take and return at the end) so the most-recently-used
+    /// connection is handed out first: that's the one least likely to have
+    /// been closed by the upstream while idle.
+    idle: Mutex<Vec<TlsStream<TcpStream>>>,
 }
 
 impl DotPool {
@@ -61,14 +72,14 @@ impl DotPool {
             port,
             server_name,
             connector,
-            idle: Mutex::new(None),
+            idle: Mutex::new(Vec::new()),
         }
     }
 
-    /// Returns a connection plus whether it came from the idle slot (vs.
+    /// Returns a connection plus whether it came from the idle pool (vs.
     /// freshly dialed) — a reused one gets a one-shot retry on failure.
     async fn checkout(&self) -> Result<(TlsStream<TcpStream>, bool)> {
-        if let Some(conn) = self.idle.lock().unwrap().take() {
+        if let Some(conn) = self.idle.lock().unwrap().pop() {
             return Ok((conn, true));
         }
         Ok((self.connect().await?, false))
@@ -85,22 +96,20 @@ impl DotPool {
             .context("TLS handshake with upstream failed")
     }
 
-    /// Parks this connection in the idle slot for the next query, unless
-    /// it's already occupied (a concurrent query's connection got there
-    /// first), in which case this one is simply dropped/closed.
+    /// Parks this connection for the next query, unless the pool is already
+    /// at capacity, in which case it's simply dropped/closed.
     fn checkin(&self, conn: TlsStream<TcpStream>) {
         let mut idle = self.idle.lock().unwrap();
-        if idle.is_none() {
-            *idle = Some(conn);
+        if idle.len() < MAX_IDLE_DOT_CONNECTIONS {
+            idle.push(conn);
         }
     }
 }
 
 enum Backend {
-    // Boxed so a live idle `TlsStream` (stored inline in `DotPool`, not
-    // behind its own pointer, now that it's an `Option` rather than a `Vec`)
-    // doesn't inflate every `Backend`/`SingleUpstream` value to DotPool's
-    // size, including the `Doh` upstreams that don't need it.
+    // Boxed so the idle `TlsStream` pool (stored inline in `DotPool`, not
+    // behind its own pointer) doesn't inflate every `Backend`/`SingleUpstream`
+    // value, including the `Doh` upstreams that don't need it.
     Dot(Box<DotPool>),
     Doh { url: String, http: reqwest::Client },
 }
@@ -638,7 +647,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dot_pool_keeps_only_one_idle_connection_across_a_concurrent_burst() {
+    async fn dot_pool_keeps_every_connection_from_a_concurrent_burst_for_reuse() {
         let tls = test_tls::generate("localhost");
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -648,7 +657,7 @@ mod tests {
         let pool = DotPool::new("127.0.0.1".to_string(), addr.port(), tls.server_name, tls.connector);
         let wire = test_query().to_vec().unwrap();
 
-        // Three concurrent queries all miss the (empty) idle slot, so each
+        // Three concurrent queries all find the idle pool empty, so each
         // must dial its own connection rather than blocking on one another.
         let (r1, r2, r3) = tokio::join!(query_dot(&pool, &wire), query_dot(&pool, &wire), query_dot(&pool, &wire));
         r1.unwrap();
@@ -657,10 +666,44 @@ mod tests {
         let after_burst = accepts.load(Ordering::SeqCst);
         assert_eq!(after_burst, 3, "concurrent queries with no idle connection available must each dial their own, not queue");
 
-        // A later serial query should reuse whichever single connection won
-        // the race to check in, not dial a fourth.
-        query_dot(&pool, &wire).await.unwrap();
-        assert_eq!(accepts.load(Ordering::SeqCst), after_burst, "the idle slot should still hold one connection from the burst");
+        // All three should have been kept, so a second identical burst is
+        // served entirely from the pool without dialing again - this is the
+        // whole point of a pool deeper than one slot.
+        let (r1, r2, r3) = tokio::join!(query_dot(&pool, &wire), query_dot(&pool, &wire), query_dot(&pool, &wire));
+        r1.unwrap();
+        r2.unwrap();
+        r3.unwrap();
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            after_burst,
+            "a repeat burst should reuse the connections the first burst established, not redial"
+        );
+    }
+
+    #[tokio::test]
+    async fn dot_pool_does_not_keep_more_than_its_idle_ceiling() {
+        let tls = test_tls::generate("localhost");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(mock_dot_server(listener, tls.acceptor, Arc::clone(&accepts), false));
+
+        let pool = DotPool::new("127.0.0.1".to_string(), addr.port(), tls.server_name, tls.connector);
+        let wire = test_query().to_vec().unwrap();
+
+        // A burst wider than the ceiling: every query still gets served, but
+        // the pool must not grow without bound holding all of them open.
+        let burst = MAX_IDLE_DOT_CONNECTIONS + 4;
+        let results = futures_util::future::join_all((0..burst).map(|_| query_dot(&pool, &wire))).await;
+        for result in results {
+            result.expect("every query in an oversized burst should still be answered");
+        }
+
+        assert_eq!(
+            pool.idle.lock().unwrap().len(),
+            MAX_IDLE_DOT_CONNECTIONS,
+            "the idle pool must cap at its ceiling and close the excess rather than hold every connection a burst opened"
+        );
     }
 
     #[tokio::test]
