@@ -1,8 +1,8 @@
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -10,9 +10,11 @@ use bytes::Bytes;
 use futures_util::future::select_ok;
 use hickory_proto::op::{Message, Query};
 use hickory_proto::rr::{Name, RecordType};
+use rustc_hash::FxHashMap;
 use rustls_pki_types::ServerName;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
+use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time::timeout;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
@@ -49,68 +51,339 @@ pub trait Upstream: Send + Sync {
     fn resolve(&self, query: &Message) -> impl Future<Output = Result<Message>> + Send;
 }
 
-/// How many idle DoT connections are kept warm per upstream. A single slot
-/// meant any burst of concurrent queries past the first had to dial its own
-/// connection and then throw it away on checkin, paying a full TCP+TLS
-/// handshake (two round trips to a public resolver, so tens of
-/// milliseconds) on every query in the burst. Keeping a few lets a burst
-/// reuse what the previous burst established.
-///
-/// Small on purpose: public DoT resolvers close idle connections within
-/// seconds, so connections beyond the working set go stale before they're
-/// reused and cost a reconnect anyway.
-const MAX_IDLE_DOT_CONNECTIONS: usize = 8;
+const MAX_DOT_CONNECTIONS: usize = 2;
+const MAX_DOT_IN_FLIGHT: usize = 256;
+const ADDRESS_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(2);
+const DOT_RESPONSE_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Persistent, reusable DoT connection to one upstream, avoiding a fresh
-/// TCP+TLS handshake per query (RFC 7858). No in-flight multiplexing — a
-/// checked-out connection serves exactly one query before returning.
+type DotReply = std::result::Result<Message, DotFailure>;
+
+#[derive(Debug, Clone)]
+enum DotFailure {
+    Connection(String),
+    Protocol(String),
+}
+
+impl std::fmt::Display for DotFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connection(message) | Self::Protocol(message) => formatter.write_str(message),
+        }
+    }
+}
+
+struct PendingQuery {
+    reply: oneshot::Sender<DotReply>,
+    expected_queries: Vec<Query>,
+    _permit: OwnedSemaphorePermit,
+}
+
+struct PendingQueryGuard {
+    connection: Arc<DotConnection>,
+    id: Option<u16>,
+}
+
+impl Drop for PendingQueryGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            self.connection.pending.lock().unwrap().remove(&id);
+        }
+    }
+}
+
+struct DotConnection {
+    writes: mpsc::UnboundedSender<Vec<u8>>,
+    pending: Mutex<FxHashMap<u16, PendingQuery>>,
+    capacity: Arc<Semaphore>,
+    last_used: AtomicU64,
+    dead: AtomicBool,
+}
+
+impl DotConnection {
+    fn start(tls: TlsStream<TcpStream>) -> Arc<Self> {
+        let (reader, writer) = tokio::io::split(tls);
+        let (writes, write_rx) = mpsc::unbounded_channel();
+        let connection = Arc::new(Self {
+            writes,
+            pending: Mutex::new(FxHashMap::default()),
+            capacity: Arc::new(Semaphore::new(MAX_DOT_IN_FLIGHT)),
+            last_used: AtomicU64::new(monotonic_millis()),
+            dead: AtomicBool::new(false),
+        });
+        tokio::spawn(dot_writer(Arc::downgrade(&connection), writer, write_rx));
+        tokio::spawn(dot_reader(Arc::downgrade(&connection), reader));
+        connection
+    }
+
+    fn is_alive(&self) -> bool {
+        !self.dead.load(Ordering::Acquire)
+    }
+
+    fn try_reserve(self: &Arc<Self>) -> Option<OwnedSemaphorePermit> {
+        self.capacity.clone().try_acquire_owned().ok()
+    }
+
+    async fn query(self: &Arc<Self>, query: &Message, permit: OwnedSemaphorePermit) -> DotReply {
+        if !self.is_alive() {
+            return Err(DotFailure::Connection("DoT connection closed".to_string()));
+        }
+
+        self.last_used.store(monotonic_millis(), Ordering::Release);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let mut outgoing = query.clone();
+        let mut frame;
+        let id;
+        {
+            let mut pending = self.pending.lock().unwrap();
+            if !self.is_alive() {
+                return Err(DotFailure::Connection("DoT connection closed".to_string()));
+            }
+
+            id = next_available_id(&pending, rand::random());
+            outgoing.metadata.id = id;
+            let wire = outgoing
+                .to_vec()
+                .map_err(|err| DotFailure::Protocol(format!("failed to encode upstream query: {err}")))?;
+            let len = u16::try_from(wire.len())
+                .map_err(|_| DotFailure::Protocol("query too large for DoT framing".to_string()))?;
+            frame = Vec::with_capacity(2 + wire.len());
+            frame.extend_from_slice(&len.to_be_bytes());
+            frame.extend_from_slice(&wire);
+            pending.insert(
+                id,
+                PendingQuery {
+                    reply: reply_tx,
+                    expected_queries: std::mem::take(&mut outgoing.queries),
+                    _permit: permit,
+                },
+            );
+        }
+        let mut guard = PendingQueryGuard {
+            connection: Arc::clone(self),
+            id: Some(id),
+        };
+        if self.writes.send(frame).is_err() {
+            self.fail(DotFailure::Connection("DoT writer stopped".to_string()));
+        }
+
+        let result = match reply_rx.await {
+            Ok(result) => result,
+            Err(_) => Err(DotFailure::Connection("DoT connection closed".to_string())),
+        };
+        guard.id = None;
+        result
+    }
+
+    fn was_idle_for(&self, duration: Duration) -> bool {
+        monotonic_millis().saturating_sub(self.last_used.load(Ordering::Acquire))
+            >= duration.as_millis() as u64
+    }
+
+    fn fail(&self, error: DotFailure) {
+        if self.dead.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        for (_, pending) in self.pending.lock().unwrap().drain() {
+            let _ = pending.reply.send(Err(error.clone()));
+        }
+    }
+}
+
+fn monotonic_millis() -> u64 {
+    static STARTED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    STARTED.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+fn next_available_id<T>(pending: &FxHashMap<u16, T>, start: u16) -> u16 {
+    (start..=u16::MAX)
+        .chain(0..start)
+        .find(|id| !pending.contains_key(id))
+        .expect("DoT in-flight limit keeps ID space from filling")
+}
+
+async fn dot_writer(
+    connection: std::sync::Weak<DotConnection>,
+    mut writer: WriteHalf<TlsStream<TcpStream>>,
+    mut writes: mpsc::UnboundedReceiver<Vec<u8>>,
+) {
+    while let Some(frame) = writes.recv().await {
+        let result = async {
+            writer.write_all(&frame).await?;
+            writer.flush().await
+        }
+        .await;
+        if let Err(err) = result {
+            if let Some(connection) = connection.upgrade() {
+                connection.fail(DotFailure::Connection(format!("failed to write DoT query: {err}")));
+            }
+            return;
+        }
+    }
+}
+
+async fn dot_reader(connection: std::sync::Weak<DotConnection>, mut reader: ReadHalf<TlsStream<TcpStream>>) {
+    loop {
+        let mut len = [0u8; 2];
+        if let Err(err) = reader.read_exact(&mut len).await {
+            if let Some(connection) = connection.upgrade() {
+                connection.fail(DotFailure::Connection(format!("failed to read DoT response length: {err}")));
+            }
+            return;
+        }
+        let mut wire = vec![0u8; u16::from_be_bytes(len) as usize];
+        if wire.is_empty() {
+            if let Some(connection) = connection.upgrade() {
+                connection.fail(DotFailure::Protocol("empty DoT response".to_string()));
+            }
+            return;
+        }
+        match timeout(DOT_RESPONSE_BODY_TIMEOUT, reader.read_exact(&mut wire)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
+                if let Some(connection) = connection.upgrade() {
+                    connection.fail(DotFailure::Connection(format!("failed to read DoT response: {err}")));
+                }
+                return;
+            }
+            Err(_) => {
+                if let Some(connection) = connection.upgrade() {
+                    connection.fail(DotFailure::Connection("timed out reading DoT response".to_string()));
+                }
+                return;
+            }
+        }
+        let response = match Message::from_vec(&wire) {
+            Ok(response) => response,
+            Err(err) => {
+                if let Some(connection) = connection.upgrade() {
+                    connection.fail(DotFailure::Protocol(format!("invalid DoT response: {err}")));
+                }
+                return;
+            }
+        };
+        let Some(connection) = connection.upgrade() else { return };
+        let pending = connection.pending.lock().unwrap().remove(&response.metadata.id);
+        match pending {
+            Some(pending) if response.queries == pending.expected_queries => {
+                let _ = pending.reply.send(Ok(response));
+            }
+            Some(pending) => {
+                let error = DotFailure::Protocol(format!(
+                    "DoT response question mismatch for ID {}",
+                    response.metadata.id
+                ));
+                let _ = pending.reply.send(Err(error));
+                connection.fail(DotFailure::Connection(
+                    "DoT connection closed after response question mismatch".to_string(),
+                ));
+                return;
+            }
+            None => {
+                connection.fail(DotFailure::Protocol(format!(
+                    "unexpected DoT response ID {}",
+                    response.metadata.id
+                )));
+                return;
+            }
+        }
+    }
+}
+
 struct DotPool {
     host: String,
     port: u16,
-    addresses: Box<[SocketAddr]>,
+    addresses: RwLock<Box<[SocketAddr]>>,
     server_name: ServerName<'static>,
     connector: TlsConnector,
-    /// Up to `MAX_IDLE_DOT_CONNECTIONS` are kept warm for reuse. Used as a
-    /// stack (take and return at the end) so the most-recently-used
-    /// connection is handed out first: that's the one least likely to have
-    /// been closed by the upstream while idle.
-    idle: Mutex<Vec<TlsStream<TcpStream>>>,
+    connections: AsyncMutex<Vec<Arc<DotConnection>>>,
+    dialing: AsyncMutex<()>,
 }
 
 impl DotPool {
-    fn new(
-        host: String,
-        port: u16,
-        addresses: Box<[SocketAddr]>,
-        server_name: ServerName<'static>,
-        connector: TlsConnector,
-    ) -> Self {
+    fn new(host: String, port: u16, addresses: Box<[SocketAddr]>, server_name: ServerName<'static>, connector: TlsConnector) -> Self {
         Self {
             host,
             port,
-            addresses,
+            addresses: RwLock::new(addresses),
             server_name,
             connector,
-            idle: Mutex::new(Vec::new()),
+            connections: AsyncMutex::new(Vec::new()),
+            dialing: AsyncMutex::new(()),
         }
     }
 
-    /// Returns a connection plus whether it came from the idle pool (vs.
-    /// freshly dialed) — a reused one gets a one-shot retry on failure.
-    async fn checkout(&self) -> Result<(TlsStream<TcpStream>, bool)> {
-        if let Some(conn) = self.idle.lock().unwrap().pop() {
-            return Ok((conn, true));
+    async fn connection(self: &Arc<Self>) -> Result<(Arc<DotConnection>, OwnedSemaphorePermit)> {
+        loop {
+            {
+                let mut connections = self.connections.lock().await;
+                connections.retain(|connection| connection.is_alive());
+                if let Some(pair) = connections
+                    .iter()
+                    .find_map(|connection| connection.try_reserve().map(|permit| (Arc::clone(connection), permit)))
+                {
+                    return Ok(pair);
+                }
+                if connections.len() >= MAX_DOT_CONNECTIONS {
+                    let waits: Vec<_> = connections
+                        .iter()
+                        .map(|connection| {
+                            let connection = Arc::clone(connection);
+                            Box::pin(async move {
+                                let permit = connection.capacity.clone().acquire_owned().await;
+                                (connection, permit)
+                            })
+                        })
+                        .collect();
+                    drop(connections);
+                    let ((connection, permit), _, _) = futures_util::future::select_all(waits).await;
+                    let permit = permit.map_err(|_| anyhow!("DoT connection closed"))?;
+                    if connection.is_alive() {
+                        return Ok((connection, permit));
+                    }
+                    continue;
+                }
+            }
+
+            let _dialing = self.dialing.lock().await;
+            let mut connections = self.connections.lock().await;
+            connections.retain(|connection| connection.is_alive());
+            if let Some(pair) = connections
+                .iter()
+                .find_map(|connection| connection.try_reserve().map(|permit| (Arc::clone(connection), permit)))
+            {
+                return Ok(pair);
+            }
+            if connections.len() < MAX_DOT_CONNECTIONS {
+                drop(connections);
+                let connection = DotConnection::start(self.connect().await?);
+                let permit = connection
+                    .try_reserve()
+                    .ok_or_else(|| anyhow!("new DoT connection has no capacity"))?;
+                self.connections.lock().await.push(Arc::clone(&connection));
+                return Ok((connection, permit));
+            }
         }
-        Ok((self.connect().await?, false))
     }
 
     async fn connect(&self) -> Result<TlsStream<TcpStream>> {
-        // `addresses` was resolved once while the state was built. Calling
-        // `TcpStream::connect((host, port))` here would run `getaddrinfo` for
-        // every new connection, putting a blocking system-DNS lookup in
-        // front of the TCP+TLS handshake on a cache miss. It can also become
-        // circular when the host's resolver points back at this server.
-        let tcp = TcpStream::connect(&*self.addresses)
+        let cached = self.addresses.read().await.clone();
+        match self.connect_to(&cached).await {
+            Ok(tls) => Ok(tls),
+            Err(first_err) => {
+                let refreshed = resolve_addresses(&self.host, self.port)
+                    .await
+                    .with_context(|| format!("cached addresses failed ({first_err:#}); refresh also failed"))?;
+                *self.addresses.write().await = refreshed.clone().into_boxed_slice();
+                self.connect_to(&refreshed).await
+            }
+        }
+    }
+
+    async fn connect_to(&self, addresses: &[SocketAddr]) -> Result<TlsStream<TcpStream>> {
+        if addresses.is_empty() {
+            bail!("upstream host {} has no cached addresses", self.host);
+        }
+        let tcp = TcpStream::connect(addresses)
             .await
             .with_context(|| format!("failed to connect to {}:{}", self.host, self.port))?;
         tcp.set_nodelay(true).ok();
@@ -120,42 +393,44 @@ impl DotPool {
             .context("TLS handshake with upstream failed")
     }
 
-    /// Parks this connection for the next query, unless the pool is already
-    /// at capacity, in which case it's simply dropped/closed.
-    fn checkin(&self, conn: TlsStream<TcpStream>) {
-        let mut idle = self.idle.lock().unwrap();
-        if idle.len() < MAX_IDLE_DOT_CONNECTIONS {
-            idle.push(conn);
+    async fn query(self: &Arc<Self>, query: &Message) -> Result<Message> {
+        let mut retried = false;
+        loop {
+            let (connection, permit) = self.connection().await?;
+            match connection.query(query, permit).await {
+                Ok(response) => return Ok(response),
+                Err(DotFailure::Connection(err)) if !retried => {
+                    retried = true;
+                    warn!(error = %err, "DoT connection failed, retrying once");
+                }
+                Err(err) => return Err(anyhow!(err)),
+            }
         }
     }
 
-    /// Keeps every currently-idle connection alive without delaying real
-    /// queries. Each connection is checked out before its probe, so a client
-    /// arriving concurrently either takes another idle connection or dials;
-    /// it never waits behind keepalive traffic on the same stream.
-    async fn keepalive(&self) {
-        let count = self.idle.lock().unwrap().len();
-        let mut connections = Vec::with_capacity(count);
-        {
-            let mut idle = self.idle.lock().unwrap();
-            for _ in 0..count {
-                if let Some(conn) = idle.pop() {
-                    connections.push(conn);
-                }
-            }
-        }
-
+    async fn keepalive(self: &Arc<Self>) {
+        let connections = {
+            let mut connections = self.connections.lock().await;
+            connections.retain(|connection| connection.is_alive());
+            connections.clone()
+        };
         let mut probe = Message::query();
-        probe.metadata.id = rand::random();
         probe.add_query(Query::query(Name::root(), RecordType::NS));
-        let Ok(wire) = probe.to_vec() else { return };
-
-        for mut conn in connections {
-            match timeout(H2_KEEPALIVE_TIMEOUT, exchange(&mut conn, &wire)).await {
-                Ok(Ok(response)) if Message::from_vec(&response).is_ok() => self.checkin(conn),
-                _ => debug!(upstream = %self.host, "dropping dead idle DoT connection during keepalive"),
+        let probes = connections.into_iter().filter_map(|connection| {
+            if !connection.was_idle_for(DOT_KEEPALIVE_INTERVAL) {
+                return None;
             }
-        }
+            let permit = connection.try_reserve()?;
+            let probe = probe.clone();
+            Some(async move {
+                match timeout(H2_KEEPALIVE_TIMEOUT, connection.query(&probe, permit)).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(err)) => connection.fail(err),
+                    Err(_) => connection.fail(DotFailure::Connection("DoT keepalive timed out".to_string())),
+                }
+            })
+        });
+        futures_util::future::join_all(probes).await;
     }
 }
 
@@ -163,7 +438,7 @@ fn start_dot_keepalive(pool: &Arc<DotPool>) {
     let pool = Arc::downgrade(pool);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(DOT_KEEPALIVE_INTERVAL);
-        interval.tick().await; // tokio intervals fire the first tick immediately
+        interval.tick().await;
         loop {
             interval.tick().await;
             let Some(pool) = pool.upgrade() else { return };
@@ -173,9 +448,6 @@ fn start_dot_keepalive(pool: &Arc<DotPool>) {
 }
 
 enum Backend {
-    // Shared because the keepalive task holds only a `Weak<DotPool>`: that
-    // lets it inspect idle connections without extending this backend's
-    // lifetime across a config reload.
     Dot(Arc<DotPool>),
     Doh { url: String, http: reqwest::Client },
 }
@@ -191,25 +463,21 @@ impl Upstream for SingleUpstream {
     }
 
     async fn resolve(&self, query: &Message) -> Result<Message> {
-        let mut outgoing = query.clone();
-        outgoing.metadata.id = rand::random();
-        let wire = outgoing.to_vec().context("failed to encode upstream query")?;
-
-        let response_bytes = match &self.backend {
-            Backend::Dot(pool) => query_dot(pool, &wire).await?,
-            // `Bytes` instead of `&[u8]`: reqwest's request body needs
-            // ownership, and the retry-once path in query_doh needs the
-            // same bytes twice - wrapping once here (no copy, just takes
-            // the Vec's buffer) means both uses are a cheap refcount clone
-            // instead of each paying their own full byte copy.
-            Backend::Doh { url, http } => query_doh(http, url, Bytes::from(wire)).await?,
-        };
-
-        let response = Message::from_vec(&response_bytes).context("failed to decode upstream response")?;
-        if response.metadata.id != outgoing.metadata.id {
-            bail!("upstream response ID mismatch");
+        match &self.backend {
+            Backend::Dot(pool) => pool.query(query).await,
+            Backend::Doh { url, http } => {
+                let mut outgoing = query.clone();
+                outgoing.metadata.id = rand::random();
+                let expected_id = outgoing.metadata.id;
+                let wire = outgoing.to_vec().context("failed to encode upstream query")?;
+                let response_bytes = query_doh(http, url, Bytes::from(wire)).await?;
+                let response = Message::from_vec(&response_bytes).context("failed to decode upstream response")?;
+                if response.metadata.id != expected_id {
+                    bail!("upstream response ID mismatch");
+                }
+                Ok(response)
+            }
         }
-        Ok(response)
     }
 }
 
@@ -481,53 +749,18 @@ pub async fn build(configs: &[UpstreamConfig], strategy: UpstreamStrategy) -> Re
 }
 
 async fn resolve_addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
-    let addresses: Vec<_> = tokio::net::lookup_host((host, port))
+    if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+    let addresses: Vec<_> = timeout(ADDRESS_RESOLUTION_TIMEOUT, tokio::net::lookup_host((host, port)))
         .await
+        .with_context(|| format!("timed out resolving upstream host {host}"))?
         .with_context(|| format!("failed to resolve upstream host {host}"))?
         .collect();
     if addresses.is_empty() {
         bail!("upstream host {host} resolved to no addresses");
     }
     Ok(addresses)
-}
-
-async fn query_dot(pool: &DotPool, wire: &[u8]) -> Result<Vec<u8>> {
-    let (mut conn, reused) = pool.checkout().await?;
-    match exchange(&mut conn, wire).await {
-        Ok(resp) => {
-            pool.checkin(conn);
-            Ok(resp)
-        }
-        // A pooled connection can go stale if the upstream closed it while idle;
-        // retry exactly once against a guaranteed-fresh connection before giving up.
-        Err(err) if reused => {
-            warn!(error = format!("{err:#}"), "pooled DoT connection appears stale, reconnecting");
-            let mut fresh = pool.connect().await?;
-            let resp = exchange(&mut fresh, wire).await?;
-            pool.checkin(fresh);
-            Ok(resp)
-        }
-        Err(err) => Err(err),
-    }
-}
-
-async fn exchange(tls: &mut TlsStream<TcpStream>, wire: &[u8]) -> Result<Vec<u8>> {
-    let len = u16::try_from(wire.len()).context("query too large for DoT framing")?;
-    // One write for the length prefix + body, rather than two, so it's a
-    // single TCP segment instead of two back-to-back ones (same reasoning
-    // as the server side's framing in server::dot::handle_connection).
-    let mut framed = Vec::with_capacity(2 + wire.len());
-    framed.extend_from_slice(&len.to_be_bytes());
-    framed.extend_from_slice(wire);
-    tls.write_all(&framed).await?;
-    tls.flush().await?;
-
-    let mut len_buf = [0u8; 2];
-    tls.read_exact(&mut len_buf).await?;
-    let resp_len = u16::from_be_bytes(len_buf) as usize;
-    let mut resp_buf = vec![0u8; resp_len];
-    tls.read_exact(&mut resp_buf).await?;
-    Ok(resp_buf)
 }
 
 async fn query_doh(http: &reqwest::Client, url: &str, wire: Bytes) -> Result<Vec<u8>> {
@@ -776,136 +1009,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dot_pool_reconnects_after_a_stale_pooled_connection() {
+    async fn concurrent_dot_queries_share_one_tls_connection() {
         let tls = test_tls::generate("localhost");
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let accepts = Arc::new(AtomicUsize::new(0));
-        tokio::spawn(mock_dot_server(listener, tls.acceptor, Arc::clone(&accepts), true));
+        tokio::spawn(mock_dot_server(listener, tls.acceptor, Arc::clone(&accepts), false));
 
-        let pool = DotPool::new("127.0.0.1".to_string(), addr.port(), vec![addr].into_boxed_slice(), tls.server_name, tls.connector);
-        let wire = test_query().to_vec().unwrap();
-
-        // Every one of these queries lands on a connection the server closes
-        // right after answering, so every query after the first must hit
-        // (and survive) the reused-but-stale retry path in `query_dot`.
-        for _ in 0..5 {
-            let resp_bytes = query_dot(&pool, &wire).await.expect("query should succeed despite the pooled connection going stale between queries");
-            let resp = Message::from_vec(&resp_bytes).unwrap();
-            assert_eq!(only_answer_ip(&resp), Ipv4Addr::new(9, 9, 9, 9));
-        }
-        assert!(
-            accepts.load(Ordering::SeqCst) >= 5,
-            "each stale reuse should have forced a fresh reconnect, got {} accepted connections",
-            accepts.load(Ordering::SeqCst)
-        );
-    }
-
-    #[tokio::test]
-    async fn dot_keepalive_removes_connections_the_upstream_closed_while_idle() {
-        let tls = test_tls::generate("localhost");
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let accepts = Arc::new(AtomicUsize::new(0));
-        tokio::spawn(mock_dot_server(listener, tls.acceptor, Arc::clone(&accepts), true));
-
-        let pool = DotPool::new(
+        let pool = Arc::new(DotPool::new(
             "127.0.0.1".to_string(),
             addr.port(),
             vec![addr].into_boxed_slice(),
             tls.server_name,
             tls.connector,
-        );
-        query_dot(&pool, &test_query().to_vec().unwrap()).await.unwrap();
-        assert_eq!(pool.idle.lock().unwrap().len(), 1, "the answered connection should initially be parked as idle");
+        ));
+        let queries: Vec<_> = (0..100).map(|_| test_query()).collect();
+        let results = futures_util::future::join_all(queries.iter().map(|query| pool.query(query))).await;
 
-        // The mock closed its side immediately after answering. The probe
-        // must discover that before a real query checks this connection out.
-        pool.keepalive().await;
-        assert_eq!(
-            pool.idle.lock().unwrap().len(),
-            0,
-            "a connection that fails its keepalive probe must not go back into the idle pool"
-        );
-    }
-
-    #[tokio::test]
-    async fn dot_pool_reuses_a_still_alive_idle_connection() {
-        let tls = test_tls::generate("localhost");
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let accepts = Arc::new(AtomicUsize::new(0));
-        tokio::spawn(mock_dot_server(listener, tls.acceptor, Arc::clone(&accepts), false));
-
-        let pool = DotPool::new("127.0.0.1".to_string(), addr.port(), vec![addr].into_boxed_slice(), tls.server_name, tls.connector);
-        let wire = test_query().to_vec().unwrap();
-
-        for _ in 0..5 {
-            let resp_bytes = query_dot(&pool, &wire).await.unwrap();
-            let resp = Message::from_vec(&resp_bytes).unwrap();
-            assert_eq!(only_answer_ip(&resp), Ipv4Addr::new(9, 9, 9, 9));
+        for response in results {
+            assert_eq!(only_answer_ip(&response.unwrap()), Ipv4Addr::new(9, 9, 9, 9));
         }
-        assert_eq!(accepts.load(Ordering::SeqCst), 1, "a healthy pooled connection should be reused, not redialed, for every query");
-    }
-
-    #[tokio::test]
-    async fn dot_pool_keeps_every_connection_from_a_concurrent_burst_for_reuse() {
-        let tls = test_tls::generate("localhost");
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let accepts = Arc::new(AtomicUsize::new(0));
-        tokio::spawn(mock_dot_server(listener, tls.acceptor, Arc::clone(&accepts), false));
-
-        let pool = DotPool::new("127.0.0.1".to_string(), addr.port(), vec![addr].into_boxed_slice(), tls.server_name, tls.connector);
-        let wire = test_query().to_vec().unwrap();
-
-        // Three concurrent queries all find the idle pool empty, so each
-        // must dial its own connection rather than blocking on one another.
-        let (r1, r2, r3) = tokio::join!(query_dot(&pool, &wire), query_dot(&pool, &wire), query_dot(&pool, &wire));
-        r1.unwrap();
-        r2.unwrap();
-        r3.unwrap();
-        let after_burst = accepts.load(Ordering::SeqCst);
-        assert_eq!(after_burst, 3, "concurrent queries with no idle connection available must each dial their own, not queue");
-
-        // All three should have been kept, so a second identical burst is
-        // served entirely from the pool without dialing again - this is the
-        // whole point of a pool deeper than one slot.
-        let (r1, r2, r3) = tokio::join!(query_dot(&pool, &wire), query_dot(&pool, &wire), query_dot(&pool, &wire));
-        r1.unwrap();
-        r2.unwrap();
-        r3.unwrap();
         assert_eq!(
             accepts.load(Ordering::SeqCst),
-            after_burst,
-            "a repeat burst should reuse the connections the first burst established, not redial"
+            1,
+            "one multiplexed DoT connection should carry the whole concurrent burst"
         );
     }
 
     #[tokio::test]
-    async fn dot_pool_does_not_keep_more_than_its_idle_ceiling() {
+    async fn dot_pool_reconnects_after_the_upstream_closes_a_connection() {
         let tls = test_tls::generate("localhost");
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let accepts = Arc::new(AtomicUsize::new(0));
-        tokio::spawn(mock_dot_server(listener, tls.acceptor, Arc::clone(&accepts), false));
+        tokio::spawn(mock_dot_server(listener, tls.acceptor, Arc::clone(&accepts), true));
 
-        let pool = DotPool::new("127.0.0.1".to_string(), addr.port(), vec![addr].into_boxed_slice(), tls.server_name, tls.connector);
-        let wire = test_query().to_vec().unwrap();
+        let pool = Arc::new(DotPool::new(
+            "127.0.0.1".to_string(),
+            addr.port(),
+            vec![addr].into_boxed_slice(),
+            tls.server_name,
+            tls.connector,
+        ));
 
-        // A burst wider than the ceiling: every query still gets served, but
-        // the pool must not grow without bound holding all of them open.
-        let burst = MAX_IDLE_DOT_CONNECTIONS + 4;
-        let results = futures_util::future::join_all((0..burst).map(|_| query_dot(&pool, &wire))).await;
-        for result in results {
-            result.expect("every query in an oversized burst should still be answered");
+        for _ in 0..5 {
+            let response = pool.query(&test_query()).await.unwrap();
+            assert_eq!(only_answer_ip(&response), Ipv4Addr::new(9, 9, 9, 9));
+            tokio::task::yield_now().await;
         }
-
-        assert_eq!(
-            pool.idle.lock().unwrap().len(),
-            MAX_IDLE_DOT_CONNECTIONS,
-            "the idle pool must cap at its ceiling and close the excess rather than hold every connection a burst opened"
+        assert!(
+            accepts.load(Ordering::SeqCst) >= 5,
+            "later queries should reconnect after each server-side close"
         );
+    }
+
+    #[test]
+    fn dot_request_ids_never_replace_an_existing_waiter() {
+        let pending = FxHashMap::from_iter([(7, ()), (8, ())]);
+
+        let id = next_available_id(&pending, 7);
+
+        assert_eq!(id, 9, "ID allocation must skip every active waiter rather than overwrite one");
     }
 
     #[tokio::test]
