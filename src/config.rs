@@ -178,11 +178,11 @@ pub struct UpstreamsConfig {
 #[serde(rename_all = "snake_case")]
 pub enum UpstreamStrategy {
     /// Try each upstream in order, falling back on failure or timeout.
-    #[default]
     Sequential,
     /// Start upstreams in order with a short delay between each, returning
     /// the first success. Usually as fast as racing every upstream while
     /// avoiding duplicate traffic when the preferred one responds promptly.
+    #[default]
     Hedged,
     /// Query every upstream at once, use whichever answers first.
     Race,
@@ -567,7 +567,7 @@ mod tests {
             base.upstream.urls,
             vec!["https://cloudflare-dns.com/dns-query".to_string()]
         );
-        assert_eq!(base.upstream.strategy, UpstreamStrategy::Sequential);
+        assert_eq!(base.upstream.strategy, UpstreamStrategy::Hedged);
         assert_eq!(base.blocking.mode, BlockMode::Nxdomain);
         assert!(base.cache.enabled);
         assert!(base.cache.max_size_bytes > 0);

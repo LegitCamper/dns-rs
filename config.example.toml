@@ -64,7 +64,7 @@ domains = [
 #                  single flaky upstream, at the cost of every query
 #                  hitting every configured upstream.
 [upstream]
-strategy = "sequential"
+strategy = "hedged"
 urls = [
   "https://cloudflare-dns.com/dns-query",
   "tls://1.1.1.1:853#cloudflare-dns.com",
