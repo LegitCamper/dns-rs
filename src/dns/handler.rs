@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use hickory_proto::op::{Message, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
@@ -10,7 +12,7 @@ use crate::state::AppState;
 /// Parses raw DNS wire bytes, resolves the query against static hosts, the
 /// response cache, the blocklist, and finally upstream, and returns the
 /// encoded wire-format response ready to send back to the client.
-pub async fn handle_query<U: Upstream>(state: &AppState<U>, raw: &[u8]) -> Vec<u8> {
+pub async fn handle_query<U: Upstream + 'static>(state: &Arc<AppState<U>>, raw: &[u8]) -> Vec<u8> {
     let request = match Message::from_vec(raw) {
         Ok(m) => m,
         Err(err) => {
@@ -26,7 +28,7 @@ pub async fn handle_query<U: Upstream>(state: &AppState<U>, raw: &[u8]) -> Vec<u
     resolve(state, &request).await
 }
 
-async fn resolve<U: Upstream>(state: &AppState<U>, request: &Message) -> Vec<u8> {
+async fn resolve<U: Upstream + 'static>(state: &Arc<AppState<U>>, request: &Message) -> Vec<u8> {
     let id = request.metadata.id;
     let op_code = request.metadata.op_code;
 
@@ -47,8 +49,26 @@ async fn resolve<U: Upstream>(state: &AppState<U>, request: &Message) -> Vec<u8>
         return encode_or_servfail(&static_response(request, question, host), id, op_code);
     }
 
-    if let Some(mut wire) = state.cache.get(&qname, qtype, qclass) {
+    if let Some((mut wire, should_refresh)) = state.cache.get(&qname, qtype, qclass) {
         debug!(%qname, ?qtype, "cache hit");
+        if should_refresh {
+            // Returning the cached response before the upstream round trip
+            // requires every value borrowed by the refresh to outlive this
+            // handler invocation, so the task owns the state and request.
+            let refresh_state = Arc::clone(state);
+            let refresh_request = request.clone();
+            let refresh_qname = qname;
+            tokio::spawn(async move {
+                let fetch_state = Arc::clone(&refresh_state);
+                let cache_key = refresh_qname.clone();
+                refresh_state
+                    .in_flight
+                    .dedup(&refresh_qname, qtype, qclass, move || async move {
+                        fetch_from_upstream(&fetch_state, &refresh_request, cache_key, qtype, qclass, id, op_code).await
+                    })
+                    .await;
+            });
+        }
         if wire.len() >= 2 {
             wire[0..2].copy_from_slice(&id.to_be_bytes());
         }
@@ -192,8 +212,8 @@ mod tests {
     use crate::dns::test_support::TestUpstream;
     use crate::dns::upstream::{MultiUpstream, Strategy};
 
-    fn build_state<U: Upstream>(upstreams: Vec<U>, strategy: Strategy) -> AppState<U> {
-        AppState {
+    fn build_state<U: Upstream>(upstreams: Vec<U>, strategy: Strategy) -> Arc<AppState<U>> {
+        Arc::new(AppState {
             static_hosts: rustc_hash::FxHashMap::default(),
             blocklist: Arc::new(ArcSwap::from_pointee(rustc_hash::FxHashSet::default())),
             cache: Arc::new(ResponseCache::new(true, 65536)),
@@ -202,7 +222,7 @@ mod tests {
             block_mode: BlockMode::Nxdomain,
             sinkhole_ip: Ipv4Addr::UNSPECIFIED,
             sinkhole_ttl: 60,
-        }
+        })
     }
 
     fn wire_query(domain: &str, qtype: RecordType, id: u16) -> Vec<u8> {
@@ -228,7 +248,7 @@ mod tests {
     async fn static_host_answers_without_touching_upstream() {
         let never = Arc::new(TestUpstream::answering("never", "9.9.9.9".parse().unwrap()));
         let mut state = build_state(vec![Arc::clone(&never)], Strategy::Sequential);
-        state.static_hosts.insert(
+        Arc::get_mut(&mut state).unwrap().static_hosts.insert(
             "nas.home.".to_string(),
             StaticHost {
                 ip: "192.168.1.10".parse().unwrap(),
@@ -248,8 +268,8 @@ mod tests {
     async fn blocklist_nxdomain_mode_blocks_without_touching_upstream() {
         let never = Arc::new(TestUpstream::answering("never", "9.9.9.9".parse().unwrap()));
         let mut state = build_state(vec![Arc::clone(&never)], Strategy::Sequential);
-        state.blocklist = Arc::new(ArcSwap::from_pointee(["ads.example.com.".to_string()].into_iter().collect()));
-        state.block_mode = BlockMode::Nxdomain;
+        Arc::get_mut(&mut state).unwrap().blocklist = Arc::new(ArcSwap::from_pointee(["ads.example.com.".to_string()].into_iter().collect()));
+        Arc::get_mut(&mut state).unwrap().block_mode = BlockMode::Nxdomain;
 
         let response = decode(&handle_query(&state, &wire_query("ads.example.com", RecordType::A, 2)).await);
 
@@ -262,9 +282,9 @@ mod tests {
     async fn blocklist_sinkhole_mode_returns_configured_ip() {
         let never = Arc::new(TestUpstream::answering("never", "9.9.9.9".parse().unwrap()));
         let mut state = build_state(vec![Arc::clone(&never)], Strategy::Sequential);
-        state.blocklist = Arc::new(ArcSwap::from_pointee(["ads.example.com.".to_string()].into_iter().collect()));
-        state.block_mode = BlockMode::Sinkhole;
-        state.sinkhole_ip = "0.0.0.0".parse().unwrap();
+        Arc::get_mut(&mut state).unwrap().blocklist = Arc::new(ArcSwap::from_pointee(["ads.example.com.".to_string()].into_iter().collect()));
+        Arc::get_mut(&mut state).unwrap().block_mode = BlockMode::Sinkhole;
+        Arc::get_mut(&mut state).unwrap().sinkhole_ip = "0.0.0.0".parse().unwrap();
 
         let response = decode(&handle_query(&state, &wire_query("ads.example.com", RecordType::A, 3)).await);
 
@@ -287,6 +307,59 @@ mod tests {
         assert_eq!(only_a_ip(&second), "5.6.7.8".parse::<Ipv4Addr>().unwrap());
         assert_eq!(second.metadata.id, 11, "cache hit must carry the new request's ID");
         assert_eq!(upstream.calls(), 1, "second identical query should be served from cache");
+    }
+
+    #[tokio::test]
+    async fn near_expiry_cache_hits_return_immediately_and_trigger_exactly_one_background_refresh() {
+        let upstream = Arc::new(
+            TestUpstream::answering("refresh", "5.6.7.8".parse().unwrap()).with_delay(Duration::from_millis(100)),
+        );
+        let state = build_state(vec![Arc::clone(&upstream)], Strategy::Sequential);
+        let query_wire = wire_query("popular.example.com", RecordType::A, 12);
+        let query = Message::from_vec(&query_wire).unwrap();
+        let mut cached = Message::response(1, OpCode::Query);
+        cached.add_query(query.queries[0].clone());
+        cached.add_answer(Record::from_rdata(
+            query.queries[0].name.clone(),
+            100,
+            RData::A(A::from("1.2.3.4".parse::<Ipv4Addr>().unwrap())),
+        ));
+        state.cache.insert(
+            "popular.example.com.".to_string(),
+            RecordType::A,
+            DNSClass::IN,
+            100,
+            cached.to_vec().unwrap(),
+        );
+        state.cache.set_remaining_ttl_for_test(
+            "popular.example.com.",
+            RecordType::A,
+            DNSClass::IN,
+            Duration::from_secs(9),
+        );
+
+        let queries: Vec<_> = (0..20)
+            .map(|i| wire_query("popular.example.com", RecordType::A, 200 + i))
+            .collect();
+        let responses = tokio::time::timeout(
+            Duration::from_millis(50),
+            futures_util::future::join_all(queries.iter().map(|query| handle_query(&state, query))),
+        )
+        .await
+        .expect("near-expiry cache hits must not wait for the delayed upstream refresh");
+
+        for response in responses {
+            assert_eq!(only_a_ip(&decode(&response)), "1.2.3.4".parse::<Ipv4Addr>().unwrap());
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while upstream.calls() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the claimed refresh should reach upstream in the background");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(upstream.calls(), 1, "many hits in one stale window must trigger exactly one upstream refresh");
     }
 
     #[tokio::test]

@@ -26,6 +26,8 @@ struct EntryMeta {
     offset: usize,
     len: usize,
     expires_at: Instant,
+    original_ttl: Duration,
+    refresh_claimed: bool,
     prev: Option<CacheKey>,
     next: Option<CacheKey>,
 }
@@ -115,28 +117,43 @@ impl ResponseCache {
         }
     }
 
-    /// Returns cached wire bytes if present and not yet expired. The caller
-    /// is responsible for patching the message ID to match the current request.
-    pub fn get(&self, name: &str, record_type: RecordType, dns_class: DNSClass) -> Option<Vec<u8>> {
+    /// Returns cached wire bytes if present and not yet expired, plus whether
+    /// this caller claimed the entry's one refresh opportunity. The caller is
+    /// responsible for patching the message ID to match the current request.
+    pub fn get(&self, name: &str, record_type: RecordType, dns_class: DNSClass) -> Option<(Vec<u8>, bool)> {
         if !self.enabled {
             return None;
         }
         let key = (record_type, dns_class, InlineName::new(name)?);
         let mut state = self.state.lock().unwrap();
+        let now = Instant::now();
 
-        let is_expired = match state.entries.get(&key) {
-            Some(meta) => meta.expires_at <= Instant::now(),
-            None => return None,
-        };
+        let is_expired = state.entries.get(&key)?.expires_at <= now;
         if is_expired {
             state.evict(key);
             return None;
         }
 
         state.touch(key);
-        let meta = state.entries.get(&key).unwrap();
+        let meta = state.entries.get_mut(&key).unwrap();
+        let should_refresh = !meta.refresh_claimed && meta.expires_at.duration_since(now) <= meta.original_ttl / 10;
+        if should_refresh {
+            meta.refresh_claimed = true;
+        }
         let (offset, len) = (meta.offset, meta.len);
-        Some(state.pool[offset..offset + len].to_vec())
+        Some((state.pool[offset..offset + len].to_vec(), should_refresh))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_remaining_ttl_for_test(
+        &self,
+        name: &str,
+        record_type: RecordType,
+        dns_class: DNSClass,
+        remaining: Duration,
+    ) {
+        let key = (record_type, dns_class, InlineName::new(name).unwrap());
+        self.state.lock().unwrap().entries.get_mut(&key).unwrap().expires_at = Instant::now() + remaining;
     }
 
     /// Stores wire bytes under the given TTL. A zero TTL means "don't cache" -
@@ -153,7 +170,8 @@ impl ResponseCache {
             return;
         };
         let key = (record_type, dns_class, inline_name);
-        let expires_at = Instant::now() + Duration::from_secs(u64::from(ttl));
+        let original_ttl = Duration::from_secs(u64::from(ttl));
+        let expires_at = Instant::now() + original_ttl;
 
         let mut state = self.state.lock().unwrap();
 
@@ -183,7 +201,18 @@ impl ResponseCache {
         unsafe {
             std::ptr::copy_nonoverlapping(wire.as_ptr(), ptr.as_ptr(), wire.len());
         }
-        state.entries.insert(key, EntryMeta { offset, len: wire.len(), expires_at, prev: None, next: None });
+        state.entries.insert(
+            key,
+            EntryMeta {
+                offset,
+                len: wire.len(),
+                expires_at,
+                original_ttl,
+                refresh_claimed: false,
+                prev: None,
+                next: None,
+            },
+        );
         state.attach_front(key);
     }
 }
@@ -329,7 +358,7 @@ mod tests {
 
         cache.insert("a.".to_string(), A, IN, 60, vec![9, 9]);
 
-        assert_eq!(cache.get("a.", A, IN), Some(vec![9, 9]));
+        assert_eq!(cache.get("a.", A, IN), Some((vec![9, 9], false)));
         assert!(cache.get("b.", A, IN).is_some(), "updating an existing key must not evict an unrelated entry");
     }
 
@@ -375,6 +404,60 @@ mod tests {
         // The reclaimed space should be usable again, not left stranded.
         cache.insert("reuse.".to_string(), A, IN, 60, vec![3; 8]);
         assert!(cache.get("reuse.", A, IN).is_some());
+    }
+
+    #[test]
+    fn entry_in_the_last_ten_percent_of_its_original_ttl_is_flagged_for_refresh() {
+        let cache = ResponseCache::new(true, 4096);
+        cache.insert("near-expiry.example.".to_string(), A, IN, 100, vec![1]);
+        cache.set_remaining_ttl_for_test("near-expiry.example.", A, IN, Duration::from_secs(9));
+
+        let (_, should_refresh) = cache.get("near-expiry.example.", A, IN).expect("entry should still be alive");
+
+        assert!(should_refresh, "an entry in the final ten percent of its original TTL should be refreshed");
+    }
+
+    #[test]
+    fn entry_with_more_than_ten_percent_of_its_original_ttl_is_not_flagged_for_refresh() {
+        let cache = ResponseCache::new(true, 4096);
+        cache.insert("fresh.example.".to_string(), A, IN, 100, vec![1]);
+        cache.set_remaining_ttl_for_test("fresh.example.", A, IN, Duration::from_secs(11));
+
+        let (_, should_refresh) = cache.get("fresh.example.", A, IN).expect("entry should still be alive");
+
+        assert!(!should_refresh, "an entry outside the final ten percent of its original TTL should not be refreshed");
+    }
+
+    #[test]
+    fn near_expiry_entry_refresh_is_claimed_exactly_once_across_many_concurrent_gets() {
+        let cache = Arc::new(ResponseCache::new(true, 4096));
+        cache.insert("popular.example.".to_string(), A, IN, 100, vec![1]);
+        cache.set_remaining_ttl_for_test("popular.example.", A, IN, Duration::from_secs(9));
+
+        let claims = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..100)
+                .map(|_| {
+                    let cache = Arc::clone(&cache);
+                    scope.spawn(move || cache.get("popular.example.", A, IN).unwrap().1)
+                })
+                .collect();
+            handles.into_iter().map(|handle| handle.join().unwrap()).filter(|claimed| *claimed).count()
+        });
+
+        assert_eq!(claims, 1, "the refresh claim must be set atomically under the cache mutex");
+    }
+
+    #[test]
+    fn replacing_an_entry_clears_its_previous_refresh_claim() {
+        let cache = ResponseCache::new(true, 4096);
+        cache.insert("replaced.example.".to_string(), A, IN, 100, vec![1]);
+        cache.set_remaining_ttl_for_test("replaced.example.", A, IN, Duration::from_secs(9));
+        assert!(cache.get("replaced.example.", A, IN).unwrap().1, "first generation should be claimed");
+
+        cache.insert("replaced.example.".to_string(), A, IN, 100, vec![2]);
+        cache.set_remaining_ttl_for_test("replaced.example.", A, IN, Duration::from_secs(9));
+
+        assert!(cache.get("replaced.example.", A, IN).unwrap().1, "a fresh insert must make its own refresh claim available");
     }
 
     #[tokio::test]

@@ -151,7 +151,7 @@ async fn handle_post(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
     respond(&state, &body).await
 }
 
-async fn respond(state: &AppState, query_bytes: &[u8]) -> Response {
+async fn respond(state: &Arc<AppState>, query_bytes: &[u8]) -> Response {
     let response_bytes = handle_query(state, query_bytes).await;
     (
         StatusCode::OK,
