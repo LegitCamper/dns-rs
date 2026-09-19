@@ -367,16 +367,13 @@ impl DotPool {
 
     async fn connect(&self) -> Result<TlsStream<TcpStream>> {
         let cached = self.addresses.read().await.clone();
-        match self.connect_to(&cached).await {
-            Ok(tls) => Ok(tls),
-            Err(first_err) => {
-                let refreshed = resolve_addresses(&self.host, self.port)
-                    .await
-                    .with_context(|| format!("cached addresses failed ({first_err:#}); refresh also failed"))?;
-                *self.addresses.write().await = refreshed.clone().into_boxed_slice();
-                self.connect_to(&refreshed).await
-            }
+        if !cached.is_empty() {
+            return self.connect_to(&cached).await;
         }
+
+        let refreshed = resolve_addresses(&self.host, self.port).await?;
+        *self.addresses.write().await = refreshed.clone().into_boxed_slice();
+        self.connect_to(&refreshed).await
     }
 
     async fn connect_to(&self, addresses: &[SocketAddr]) -> Result<TlsStream<TcpStream>> {
@@ -669,10 +666,10 @@ impl<U: Upstream> MultiUpstream<U> {
     }
 }
 
-/// Builds the production upstream pool from parsed config. Every hostname is
-/// resolved here once and pinned into its transport; reconnects then go
-/// straight to those addresses instead of putting a system-DNS lookup in
-/// front of every fresh TCP connection.
+/// Builds production upstream pool. DoT hostnames are resolved eagerly so
+/// healthy reconnects skip system DNS; failed initial resolution falls back to
+/// lazy dialing, keeping unrelated listeners available. DoH uses reqwest's
+/// resolver cache so addresses can rotate after TTL expiry.
 pub async fn build(configs: &[UpstreamConfig], strategy: UpstreamStrategy) -> Result<MultiUpstream<SingleUpstream>> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -683,11 +680,10 @@ pub async fn build(configs: &[UpstreamConfig], strategy: UpstreamStrategy) -> Re
     );
     let connector = TlsConnector::from(tls_config);
 
-    // One reqwest client is still shared by every DoH upstream so its h2
-    // pool stays shared too. Each configured host gets a resolver override;
-    // reqwest copies these addresses into the builder, so the temporary Vecs
-    // can be dropped after each iteration.
-    let mut doh_builder = reqwest::Client::builder()
+    // One reqwest client is shared by every DoH upstream so h2 pooling and
+    // reqwest's resolver cache are shared too. Unlike permanent address
+    // overrides, normal resolution can recover when a provider rotates IPs.
+    let doh_builder = reqwest::Client::builder()
         .user_agent(concat!("dns-rs/", env!("CARGO_PKG_VERSION")))
         .timeout(UPSTREAM_TIMEOUT)
         // Public DoH resolvers drop idle h2 connections quickly. Without
@@ -702,16 +698,6 @@ pub async fn build(configs: &[UpstreamConfig], strategy: UpstreamStrategy) -> Re
         // Keepalive is what actually holds the connection open now, so
         // don't let the pool's own idle timer reap a healthy one first.
         .pool_idle_timeout(None);
-    for cfg in configs {
-        if let UpstreamConfig::Doh { url } = cfg {
-            let parsed = reqwest::Url::parse(url).with_context(|| format!("invalid upstream DoH URL: {url}"))?;
-            let host = parsed.host_str().ok_or_else(|| anyhow!("upstream DoH URL has no host: {url}"))?;
-            if host.parse::<std::net::IpAddr>().is_err() {
-                let addresses = resolve_addresses(host, parsed.port_or_known_default().unwrap_or(443)).await?;
-                doh_builder = doh_builder.resolve_to_addrs(host, &addresses);
-            }
-        }
-    }
     let doh_http = doh_builder.build().context("failed to build upstream DoH HTTP client")?;
 
     let mut upstreams = Vec::with_capacity(configs.len());
@@ -720,7 +706,14 @@ pub async fn build(configs: &[UpstreamConfig], strategy: UpstreamStrategy) -> Re
             UpstreamConfig::Dot { host, port, tls_name } => {
                 let server_name = ServerName::try_from(tls_name.clone())
                     .with_context(|| format!("invalid upstream tls_name: {tls_name}"))?;
-                let addresses = resolve_addresses(host, *port).await?.into_boxed_slice();
+                let addresses = match resolve_addresses(host, *port).await {
+                    Ok(addresses) => addresses,
+                    Err(err) => {
+                        warn!(upstream = %host, error = format!("{err:#}"), "failed to resolve DoT host at startup, deferring to first connection");
+                        Vec::new()
+                    }
+                }
+                .into_boxed_slice();
                 let pool = Arc::new(DotPool::new(
                     host.clone(),
                     *port,
