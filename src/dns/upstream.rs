@@ -37,6 +37,11 @@ const H2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 /// timeline rather than on a query's.
 const H2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// DoT has no transport-level PING equivalent. Send a tiny root-NS query on
+/// idle connections at the same cadence as the DoH h2 PING so the upstream
+/// doesn't reap them between real query bursts.
+const DOT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+
 /// A single upstream resolver. Implemented by the real `SingleUpstream` and
 /// by network-free test doubles (see `test_support`).
 pub trait Upstream: Send + Sync {
@@ -123,13 +128,55 @@ impl DotPool {
             idle.push(conn);
         }
     }
+
+    /// Keeps every currently-idle connection alive without delaying real
+    /// queries. Each connection is checked out before its probe, so a client
+    /// arriving concurrently either takes another idle connection or dials;
+    /// it never waits behind keepalive traffic on the same stream.
+    async fn keepalive(&self) {
+        let count = self.idle.lock().unwrap().len();
+        let mut connections = Vec::with_capacity(count);
+        {
+            let mut idle = self.idle.lock().unwrap();
+            for _ in 0..count {
+                if let Some(conn) = idle.pop() {
+                    connections.push(conn);
+                }
+            }
+        }
+
+        let mut probe = Message::query();
+        probe.metadata.id = rand::random();
+        probe.add_query(Query::query(Name::root(), RecordType::NS));
+        let Ok(wire) = probe.to_vec() else { return };
+
+        for mut conn in connections {
+            match timeout(H2_KEEPALIVE_TIMEOUT, exchange(&mut conn, &wire)).await {
+                Ok(Ok(response)) if Message::from_vec(&response).is_ok() => self.checkin(conn),
+                _ => debug!(upstream = %self.host, "dropping dead idle DoT connection during keepalive"),
+            }
+        }
+    }
+}
+
+fn start_dot_keepalive(pool: &Arc<DotPool>) {
+    let pool = Arc::downgrade(pool);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(DOT_KEEPALIVE_INTERVAL);
+        interval.tick().await; // tokio intervals fire the first tick immediately
+        loop {
+            interval.tick().await;
+            let Some(pool) = pool.upgrade() else { return };
+            pool.keepalive().await;
+        }
+    });
 }
 
 enum Backend {
-    // Boxed so the idle `TlsStream` pool (stored inline in `DotPool`, not
-    // behind its own pointer) doesn't inflate every `Backend`/`SingleUpstream`
-    // value, including the `Doh` upstreams that don't need it.
-    Dot(Box<DotPool>),
+    // Shared because the keepalive task holds only a `Weak<DotPool>`: that
+    // lets it inspect idle connections without extending this backend's
+    // lifetime across a config reload.
+    Dot(Arc<DotPool>),
     Doh { url: String, http: reqwest::Client },
 }
 
@@ -406,15 +453,17 @@ pub async fn build(configs: &[UpstreamConfig], strategy: UpstreamStrategy) -> Re
                 let server_name = ServerName::try_from(tls_name.clone())
                     .with_context(|| format!("invalid upstream tls_name: {tls_name}"))?;
                 let addresses = resolve_addresses(host, *port).await?.into_boxed_slice();
+                let pool = Arc::new(DotPool::new(
+                    host.clone(),
+                    *port,
+                    addresses,
+                    server_name,
+                    connector.clone(),
+                ));
+                start_dot_keepalive(&pool);
                 SingleUpstream {
                     label: format!("dot://{host}:{port}"),
-                    backend: Backend::Dot(Box::new(DotPool::new(
-                        host.clone(),
-                        *port,
-                        addresses,
-                        server_name,
-                        connector.clone(),
-                    ))),
+                    backend: Backend::Dot(pool),
                 }
             }
             UpstreamConfig::Doh { url } => SingleUpstream {
@@ -753,6 +802,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dot_keepalive_removes_connections_the_upstream_closed_while_idle() {
+        let tls = test_tls::generate("localhost");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(mock_dot_server(listener, tls.acceptor, Arc::clone(&accepts), true));
+
+        let pool = DotPool::new(
+            "127.0.0.1".to_string(),
+            addr.port(),
+            vec![addr].into_boxed_slice(),
+            tls.server_name,
+            tls.connector,
+        );
+        query_dot(&pool, &test_query().to_vec().unwrap()).await.unwrap();
+        assert_eq!(pool.idle.lock().unwrap().len(), 1, "the answered connection should initially be parked as idle");
+
+        // The mock closed its side immediately after answering. The probe
+        // must discover that before a real query checks this connection out.
+        pool.keepalive().await;
+        assert_eq!(
+            pool.idle.lock().unwrap().len(),
+            0,
+            "a connection that fails its keepalive probe must not go back into the idle pool"
+        );
+    }
+
+    #[tokio::test]
     async fn dot_pool_reuses_a_still_alive_idle_connection() {
         let tls = test_tls::generate("localhost");
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -841,7 +918,7 @@ mod tests {
 
         let upstream = SingleUpstream {
             label: "dot://test".to_string(),
-            backend: Backend::Dot(Box::new(DotPool::new(
+            backend: Backend::Dot(Arc::new(DotPool::new(
                 "127.0.0.1".to_string(),
                 addr.port(),
                 vec![addr].into_boxed_slice(),
@@ -865,7 +942,7 @@ mod tests {
         // Port 1 on loopback: nothing listening, so the dial fails fast.
         let unreachable = SingleUpstream {
             label: "dot://unreachable".to_string(),
-            backend: Backend::Dot(Box::new(DotPool::new(
+            backend: Backend::Dot(Arc::new(DotPool::new(
                 "127.0.0.1".to_string(),
                 1,
                 vec!["127.0.0.1:1".parse().unwrap()].into_boxed_slice(),
