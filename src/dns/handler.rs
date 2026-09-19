@@ -51,7 +51,15 @@ async fn resolve<U: Upstream + 'static>(state: &Arc<AppState<U>>, request: &Mess
 
     if let Some((mut wire, should_refresh)) = state.cache.get(&qname, qtype, qclass) {
         debug!(%qname, ?qtype, "cache hit");
-        if should_refresh {
+        // A name can become blocked while an older allowed answer is still
+        // cached. Preserve the existing cache-until-expiry behavior, but do
+        // not refresh that answer and thereby keep bypassing the newer
+        // blocklist forever.
+        if should_refresh && state.blocklist.load().contains(&qname) {
+            // Keep the claim available in case a later blocklist refresh
+            // whitelists the name again before this cached answer expires.
+            state.cache.release_refresh_claim(&qname, qtype, qclass);
+        } else if should_refresh {
             // Returning the cached response before the upstream round trip
             // requires every value borrowed by the refresh to outlive this
             // handler invocation, so the task owns the state and request.
@@ -368,6 +376,47 @@ mod tests {
         .expect("the claimed refresh should reach upstream in the background");
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert_eq!(upstream.calls(), 1, "many hits in one stale window must trigger exactly one upstream refresh");
+    }
+
+    #[tokio::test]
+    async fn near_expiry_allowed_answer_is_not_refreshed_after_domain_becomes_blocked() {
+        let upstream = Arc::new(TestUpstream::answering("refresh", "5.6.7.8".parse().unwrap()));
+        let mut state = build_state(vec![Arc::clone(&upstream)], Strategy::Sequential);
+        let query_wire = wire_query("newly-blocked.example.com", RecordType::A, 12);
+        let query = Message::from_vec(&query_wire).unwrap();
+        let mut cached = Message::response(1, OpCode::Query);
+        cached.add_query(query.queries[0].clone());
+        cached.add_answer(Record::from_rdata(
+            query.queries[0].name.clone(),
+            100,
+            RData::A(A::from("1.2.3.4".parse::<Ipv4Addr>().unwrap())),
+        ));
+        state.cache.insert(
+            "newly-blocked.example.com.".to_string(),
+            RecordType::A,
+            DNSClass::IN,
+            100,
+            cached.to_vec().unwrap(),
+        );
+        state.cache.set_remaining_ttl_for_test(
+            "newly-blocked.example.com.",
+            RecordType::A,
+            DNSClass::IN,
+            Duration::from_secs(9),
+        );
+        Arc::get_mut(&mut state).unwrap().blocklist = Arc::new(ArcSwap::from_pointee(
+            ["newly-blocked.example.com.".to_string()].into_iter().collect(),
+        ));
+
+        let response = decode(&handle_query(&state, &query_wire).await);
+        tokio::task::yield_now().await;
+
+        assert_eq!(only_a_ip(&response), "1.2.3.4".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(
+            upstream.calls(),
+            0,
+            "a newly-blocked name may finish its existing cache lifetime, but that old allowed answer must never be refreshed"
+        );
     }
 
     #[tokio::test]
