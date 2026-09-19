@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -56,6 +57,7 @@ const MAX_IDLE_DOT_CONNECTIONS: usize = 8;
 struct DotPool {
     host: String,
     port: u16,
+    addresses: Box<[SocketAddr]>,
     server_name: ServerName<'static>,
     connector: TlsConnector,
     /// Up to `MAX_IDLE_DOT_CONNECTIONS` are kept warm for reuse. Used as a
@@ -66,10 +68,17 @@ struct DotPool {
 }
 
 impl DotPool {
-    fn new(host: String, port: u16, server_name: ServerName<'static>, connector: TlsConnector) -> Self {
+    fn new(
+        host: String,
+        port: u16,
+        addresses: Box<[SocketAddr]>,
+        server_name: ServerName<'static>,
+        connector: TlsConnector,
+    ) -> Self {
         Self {
             host,
             port,
+            addresses,
             server_name,
             connector,
             idle: Mutex::new(Vec::new()),
@@ -86,7 +95,12 @@ impl DotPool {
     }
 
     async fn connect(&self) -> Result<TlsStream<TcpStream>> {
-        let tcp = TcpStream::connect((self.host.as_str(), self.port))
+        // `addresses` was resolved once while the state was built. Calling
+        // `TcpStream::connect((host, port))` here would run `getaddrinfo` for
+        // every new connection, putting a blocking system-DNS lookup in
+        // front of the TCP+TLS handshake on a cache miss. It can also become
+        // circular when the host's resolver points back at this server.
+        let tcp = TcpStream::connect(&*self.addresses)
             .await
             .with_context(|| format!("failed to connect to {}:{}", self.host, self.port))?;
         tcp.set_nodelay(true).ok();
@@ -298,8 +312,11 @@ impl<U: Upstream> MultiUpstream<U> {
     }
 }
 
-/// Builds the production upstream pool from parsed config.
-pub fn build(configs: &[UpstreamConfig], strategy: UpstreamStrategy) -> Result<MultiUpstream<SingleUpstream>> {
+/// Builds the production upstream pool from parsed config. Every hostname is
+/// resolved here once and pinned into its transport; reconnects then go
+/// straight to those addresses instead of putting a system-DNS lookup in
+/// front of every fresh TCP connection.
+pub async fn build(configs: &[UpstreamConfig], strategy: UpstreamStrategy) -> Result<MultiUpstream<SingleUpstream>> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let tls_config = Arc::new(
@@ -309,7 +326,11 @@ pub fn build(configs: &[UpstreamConfig], strategy: UpstreamStrategy) -> Result<M
     );
     let connector = TlsConnector::from(tls_config);
 
-    let doh_http = reqwest::Client::builder()
+    // One reqwest client is still shared by every DoH upstream so its h2
+    // pool stays shared too. Each configured host gets a resolver override;
+    // reqwest copies these addresses into the builder, so the temporary Vecs
+    // can be dropped after each iteration.
+    let mut doh_builder = reqwest::Client::builder()
         .user_agent(concat!("dns-rs/", env!("CARGO_PKG_VERSION")))
         .timeout(UPSTREAM_TIMEOUT)
         // Public DoH resolvers drop idle h2 connections quickly. Without
@@ -323,9 +344,18 @@ pub fn build(configs: &[UpstreamConfig], strategy: UpstreamStrategy) -> Result<M
         .http2_keep_alive_while_idle(true)
         // Keepalive is what actually holds the connection open now, so
         // don't let the pool's own idle timer reap a healthy one first.
-        .pool_idle_timeout(None)
-        .build()
-        .context("failed to build upstream DoH HTTP client")?;
+        .pool_idle_timeout(None);
+    for cfg in configs {
+        if let UpstreamConfig::Doh { url } = cfg {
+            let parsed = reqwest::Url::parse(url).with_context(|| format!("invalid upstream DoH URL: {url}"))?;
+            let host = parsed.host_str().ok_or_else(|| anyhow!("upstream DoH URL has no host: {url}"))?;
+            if host.parse::<std::net::IpAddr>().is_err() {
+                let addresses = resolve_addresses(host, parsed.port_or_known_default().unwrap_or(443)).await?;
+                doh_builder = doh_builder.resolve_to_addrs(host, &addresses);
+            }
+        }
+    }
+    let doh_http = doh_builder.build().context("failed to build upstream DoH HTTP client")?;
 
     let mut upstreams = Vec::with_capacity(configs.len());
     for cfg in configs {
@@ -333,9 +363,16 @@ pub fn build(configs: &[UpstreamConfig], strategy: UpstreamStrategy) -> Result<M
             UpstreamConfig::Dot { host, port, tls_name } => {
                 let server_name = ServerName::try_from(tls_name.clone())
                     .with_context(|| format!("invalid upstream tls_name: {tls_name}"))?;
+                let addresses = resolve_addresses(host, *port).await?.into_boxed_slice();
                 SingleUpstream {
                     label: format!("dot://{host}:{port}"),
-                    backend: Backend::Dot(Box::new(DotPool::new(host.clone(), *port, server_name, connector.clone()))),
+                    backend: Backend::Dot(Box::new(DotPool::new(
+                        host.clone(),
+                        *port,
+                        addresses,
+                        server_name,
+                        connector.clone(),
+                    ))),
                 }
             }
             UpstreamConfig::Doh { url } => SingleUpstream {
@@ -350,6 +387,17 @@ pub fn build(configs: &[UpstreamConfig], strategy: UpstreamStrategy) -> Result<M
     }
 
     Ok(MultiUpstream::new(upstreams, strategy.into()))
+}
+
+async fn resolve_addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+    let addresses: Vec<_> = tokio::net::lookup_host((host, port))
+        .await
+        .with_context(|| format!("failed to resolve upstream host {host}"))?
+        .collect();
+    if addresses.is_empty() {
+        bail!("upstream host {host} resolved to no addresses");
+    }
+    Ok(addresses)
 }
 
 async fn query_dot(pool: &DotPool, wire: &[u8]) -> Result<Vec<u8>> {
@@ -609,7 +657,7 @@ mod tests {
         let accepts = Arc::new(AtomicUsize::new(0));
         tokio::spawn(mock_dot_server(listener, tls.acceptor, Arc::clone(&accepts), true));
 
-        let pool = DotPool::new("127.0.0.1".to_string(), addr.port(), tls.server_name, tls.connector);
+        let pool = DotPool::new("127.0.0.1".to_string(), addr.port(), vec![addr].into_boxed_slice(), tls.server_name, tls.connector);
         let wire = test_query().to_vec().unwrap();
 
         // Every one of these queries lands on a connection the server closes
@@ -635,7 +683,7 @@ mod tests {
         let accepts = Arc::new(AtomicUsize::new(0));
         tokio::spawn(mock_dot_server(listener, tls.acceptor, Arc::clone(&accepts), false));
 
-        let pool = DotPool::new("127.0.0.1".to_string(), addr.port(), tls.server_name, tls.connector);
+        let pool = DotPool::new("127.0.0.1".to_string(), addr.port(), vec![addr].into_boxed_slice(), tls.server_name, tls.connector);
         let wire = test_query().to_vec().unwrap();
 
         for _ in 0..5 {
@@ -654,7 +702,7 @@ mod tests {
         let accepts = Arc::new(AtomicUsize::new(0));
         tokio::spawn(mock_dot_server(listener, tls.acceptor, Arc::clone(&accepts), false));
 
-        let pool = DotPool::new("127.0.0.1".to_string(), addr.port(), tls.server_name, tls.connector);
+        let pool = DotPool::new("127.0.0.1".to_string(), addr.port(), vec![addr].into_boxed_slice(), tls.server_name, tls.connector);
         let wire = test_query().to_vec().unwrap();
 
         // Three concurrent queries all find the idle pool empty, so each
@@ -688,7 +736,7 @@ mod tests {
         let accepts = Arc::new(AtomicUsize::new(0));
         tokio::spawn(mock_dot_server(listener, tls.acceptor, Arc::clone(&accepts), false));
 
-        let pool = DotPool::new("127.0.0.1".to_string(), addr.port(), tls.server_name, tls.connector);
+        let pool = DotPool::new("127.0.0.1".to_string(), addr.port(), vec![addr].into_boxed_slice(), tls.server_name, tls.connector);
         let wire = test_query().to_vec().unwrap();
 
         // A burst wider than the ceiling: every query still gets served, but
@@ -716,7 +764,13 @@ mod tests {
 
         let upstream = SingleUpstream {
             label: "dot://test".to_string(),
-            backend: Backend::Dot(Box::new(DotPool::new("127.0.0.1".to_string(), addr.port(), tls.server_name, tls.connector))),
+            backend: Backend::Dot(Box::new(DotPool::new(
+                "127.0.0.1".to_string(),
+                addr.port(),
+                vec![addr].into_boxed_slice(),
+                tls.server_name,
+                tls.connector,
+            ))),
         };
         let pool = MultiUpstream::new(vec![upstream], Strategy::Sequential);
 
@@ -737,6 +791,7 @@ mod tests {
             backend: Backend::Dot(Box::new(DotPool::new(
                 "127.0.0.1".to_string(),
                 1,
+                vec!["127.0.0.1:1".parse().unwrap()].into_boxed_slice(),
                 ServerName::try_from("localhost").unwrap(),
                 TlsConnector::from(Arc::new(
                     rustls::ClientConfig::builder().with_root_certificates(rustls::RootCertStore::empty()).with_no_client_auth(),

@@ -46,7 +46,7 @@ impl AppState<SingleUpstream> {
             blocklist: blocklist_manager.merged_set(),
             cache,
             in_flight: InFlightRegistry::new(),
-            upstreams: upstream::build(&upstream_configs, config.upstream.strategy)?,
+            upstreams: upstream::build(&upstream_configs, config.upstream.strategy).await?,
             block_mode: config.blocking.mode,
             sinkhole_ip: config.blocking.sinkhole_ip,
             sinkhole_ttl: config.server.default_ttl,
