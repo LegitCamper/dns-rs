@@ -20,6 +20,16 @@ use crate::config::{UpstreamConfig, UpstreamStrategy};
 
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How often an idle upstream DoH connection sends an HTTP/2 PING. Well
+/// under the ~30-60s public resolvers take to reap an idle connection, so
+/// the connection stays established between query bursts.
+const H2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+
+/// How long a keepalive PING may go unanswered before the connection is
+/// considered dead and dropped from the pool - on the keepalive's own
+/// timeline rather than on a query's.
+const H2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// A single upstream resolver. Implemented by the real `SingleUpstream` and
 /// by network-free test doubles (see `test_support`).
 pub trait Upstream: Send + Sync {
@@ -254,6 +264,18 @@ pub fn build(configs: &[UpstreamConfig], strategy: UpstreamStrategy) -> Result<M
     let doh_http = reqwest::Client::builder()
         .user_agent(concat!("dns-rs/", env!("CARGO_PKG_VERSION")))
         .timeout(UPSTREAM_TIMEOUT)
+        // Public DoH resolvers drop idle h2 connections quickly. Without
+        // these, a query arriving after a lull pays a fresh TCP+TLS
+        // handshake - or worse, discovers the connection is dead only on
+        // send and eats the `query_doh` retry on top. PINGing while idle
+        // keeps the connection established and lets the pool notice a dead
+        // one out-of-band instead of on a client's critical path.
+        .http2_keep_alive_interval(H2_KEEPALIVE_INTERVAL)
+        .http2_keep_alive_timeout(H2_KEEPALIVE_TIMEOUT)
+        .http2_keep_alive_while_idle(true)
+        // Keepalive is what actually holds the connection open now, so
+        // don't let the pool's own idle timer reap a healthy one first.
+        .pool_idle_timeout(None)
         .build()
         .context("failed to build upstream DoH HTTP client")?;
 
