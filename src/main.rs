@@ -36,6 +36,12 @@ use tracing_subscriber::EnvFilter;
 use config::Config;
 use state::AppState;
 
+/// Startup may spend this long establishing upstream connections before it
+/// begins accepting client traffic. This makes warming deterministic for
+/// healthy resolvers without turning an unreachable upstream into a long
+/// readiness outage.
+const UPSTREAM_WARMUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Polling (not inotify) is deliberate: trivially correct across
 /// atomic-rename config writes, no extra dependency, and reload latency of a
 /// few seconds is a non-issue here.
@@ -161,14 +167,12 @@ async fn run_configured() -> Result<()> {
 async fn spawn_listeners(config: &Config, shutdown: CancellationToken) -> Result<Vec<Listener>> {
     let state = Arc::new(AppState::build(config, shutdown.clone()).await?);
 
-    // Dial every upstream now so the first client query doesn't pay a
-    // TCP+TLS handshake that a background task could have paid instead.
-    // Not awaited: startup shouldn't block on a round trip to a public
-    // resolver, and the listeners must come up whether or not it succeeds.
-    tokio::spawn({
-        let state = Arc::clone(&state);
-        async move { state.upstreams.warm_all().await }
-    });
+    // Warm before binding listeners: a detached task raced the first client,
+    // so the one query this optimization was meant to help could still dial
+    // alongside the probe and pay the full handshake. Bound the wait so a
+    // down upstream delays readiness by at most one second; `warm_all` logs
+    // individual failures and the ordinary fallback path remains available.
+    let _ = tokio::time::timeout(UPSTREAM_WARMUP_TIMEOUT, state.upstreams.warm_all()).await;
 
     let mut listeners = Vec::new();
 
