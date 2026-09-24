@@ -1,51 +1,64 @@
+app = 'dns-rs-cold-hollow-7445'
+primary_region = 'dfw'
+
 [build]
-  image = "ghcr.io/legitcamper/dns-rs-serverless:latest"
+image = 'ghcr.io/legitcamper/dns-rs-serverless:latest'
 
 [env]
-  DNSRS_DOH_PORT = "8053"
-  DNSRS_DOT_PORT = "8853"
+DNSRS_DOH_PORT = '8053'
+DNSRS_DOT_PORT = '8853'
+DNSRS_BLOCKLIST_REFRESH_SECS = '43200'
+DNSRS_BLOCKLIST_URLS = 'https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts,https://easylist.to/easylist/easylist.txt,https://easylist.to/easylist/easyprivacy.txt,https://secure.fanboy.co.nz/fanboy-annoyance.txt,https://secure.fanboy.co.nz/fanboy-cookiemonster.txt,https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/domains/pro.plus.txt,https://raw.githubusercontent.com/blocklistproject/Lists/refs/heads/main/ads.txt,https://raw.githubusercontent.com/blocklistproject/Lists/refs/heads/main/phishing.txt,https://raw.githubusercontent.com/blocklistproject/Lists/refs/heads/main/smart-tv.txt,https://raw.githubusercontent.com/blocklistproject/Lists/refs/heads/main/tracking.txt,https://raw.githubusercontent.com/blocklistproject/Lists/refs/heads/main/fraud.txt,https://raw.githubusercontent.com/blocklistproject/Lists/refs/heads/main/ransomware.txt'
+DNSRS_WHITELIST_REFRESH_SECS = '43200'
+DNSRS_WHITELIST_URLS = 'https://raw.githubusercontent.com/GoodnessJSON/PiHole-Whitelist/refs/heads/master/lists/optional-list.txt,https://raw.githubusercontent.com/GoodnessJSON/PiHole-Whitelist/refs/heads/master/lists/referral-sites.txt,https://raw.githubusercontent.com/GoodnessJSON/PiHole-Whitelist/refs/heads/master/lists/whitelist.txt'
+DNSRS_UPSTREAM_STRATEGY = 'sequential'
+DNSRS_UPSTREAM_URLS = 'https://cloudflare-dns.com/dns-query,https://dns.quad9.net/dns-query,https://anycast.uncensoreddns.org/dns-query,tls://1.1.1.1:853#cloudflare-dns.com'
+DNSRS_STATIC_HOSTS = 'homenas=100.75.47.18,bevbot=100.116.101.69,bevbot2=100.116.124.26'
 
 [[services]]
-  protocol = "tcp"
-  internal_port = 8053
-  auto_stop_machines = "off"
-  auto_start_machines = true
-  min_machines_running = 1
+protocol = 'tcp'
+internal_port = 8053
+auto_stop_machines = 'off'
+auto_start_machines = true
+min_machines_running = 1
 
-  [[services.ports]]
-    port = 443
-    handlers = ["tls", "http"]
-    [services.ports.tls_options]
-      alpn = ["h2", "http/1.1"]
-      versions = ["TLSv1.2", "TLSv1.3"]
+[[services.ports]]
+port = 443
+handlers = ['tls', 'http']
 
-  [[services.http_checks]]
-    interval = "15s"
-    timeout = "2s"
-    grace_period = "10s"
-    method = "GET"
-    path = "/healthz"
-    protocol = "http"
+[services.ports.tls_options]
+alpn = ['h2', 'http/1.1']
+versions = ['TLSv1.2', 'TLSv1.3']
+
+[[services.http_checks]]
+interval = '15s'
+timeout = '2s'
+grace_period = '10s'
+method = 'GET'
+path = '/healthz'
+protocol = 'http'
 
 [[services]]
-  protocol = "tcp"
-  internal_port = 8853
-  auto_stop_machines = "off"
-  auto_start_machines = true
-  min_machines_running = 1
+protocol = 'tcp'
+internal_port = 8853
+auto_stop_machines = 'off'
+auto_start_machines = true
+min_machines_running = 1
 
-  [[services.ports]]
-    port = 853
-    handlers = ["tls"]
-    [services.ports.tls_options]
-      alpn = ["dot"]
-      versions = ["TLSv1.2", "TLSv1.3"]
+[[services.ports]]
+port = 853
+handlers = ['tls']
 
-  [[services.tcp_checks]]
-    interval = "15s"
-    timeout = "2s"
-    grace_period = "10s"
+[services.ports.tls_options]
+versions = ['TLSv1.2', 'TLSv1.3']
+
+[[services.tcp_checks]]
+interval = '15s'
+timeout = '2s'
+grace_period = '10s'
 
 [[vm]]
-  size = "shared-cpu-1x"
-  memory = "256mb"
+size = 'shared-cpu-1x'
+memory = '512mb'
+cpus = 1
+memory_mb = 512
