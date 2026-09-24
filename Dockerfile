@@ -94,9 +94,9 @@ RUN setcap 'cap_net_bind_service=+ep' /usr/local/bin/dns-rs \
 USER dns-rs
 WORKDIR /etc/dns-rs
 
-# Default feature set only: a --features serverless image serves plaintext DoH on
-# ${PORT:-8053} and never binds these.
-EXPOSE 853/tcp 443/tcp
+# Default build serves TLS itself on these ports. The serverless image uses
+# plaintext internal DoH on 8053 and DNS-over-TCP on 8853 behind platform TLS.
+EXPOSE 443/tcp 853/tcp 8053/tcp 8853/tcp
 
 ENTRYPOINT ["/usr/local/bin/dns-rs"]
 # Default build reads this config; serverless builds ignore command-line arguments.

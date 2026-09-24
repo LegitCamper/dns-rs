@@ -815,19 +815,19 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration as StdDuration;
 
-    #[cfg(feature = "doh-tls")]
+    #[cfg(feature = "doh")]
     use axum::body::Body;
-    #[cfg(feature = "doh-tls")]
+    #[cfg(feature = "doh")]
     use axum::extract::State;
-    #[cfg(feature = "doh-tls")]
+    #[cfg(feature = "doh")]
     use axum::http::{header, StatusCode};
-    #[cfg(feature = "doh-tls")]
+    #[cfg(feature = "doh")]
     use axum::response::{IntoResponse, Response};
-    #[cfg(feature = "doh-tls")]
+    #[cfg(feature = "doh")]
     use axum::routing::post;
-    #[cfg(feature = "doh-tls")]
+    #[cfg(feature = "doh")]
     use axum::Router;
-    #[cfg(feature = "doh-tls")]
+    #[cfg(feature = "doh")]
     use axum_server::tls_rustls::RustlsConfig;
     use hickory_proto::op::{OpCode, Query};
     use hickory_proto::rr::rdata::A;
@@ -1117,7 +1117,7 @@ mod tests {
         pool.warm_all().await;
     }
 
-    #[cfg(feature = "doh-tls")]
+    #[cfg(feature = "doh")]
     #[derive(Clone, Copy)]
     enum DohMockMode {
         /// First request's body fails mid-stream (as a live connection dying
@@ -1129,7 +1129,7 @@ mod tests {
         AlwaysServerError,
     }
 
-    #[cfg(feature = "doh-tls")]
+    #[cfg(feature = "doh")]
     async fn doh_mock_handler(State((counter, mode)): State<(Arc<AtomicUsize>, DohMockMode)>) -> Response {
         let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
         match mode {
@@ -1151,7 +1151,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "doh-tls")]
+    #[cfg(feature = "doh")]
     /// Binds a self-signed-TLS mock DoH server on an OS-assigned port and
     /// returns its address plus a shared counter of requests it has received.
     async fn spawn_doh_mock(tls_config: Arc<rustls::ServerConfig>, mode: DohMockMode) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
@@ -1171,7 +1171,7 @@ mod tests {
         (addr, counter)
     }
 
-    #[cfg(feature = "doh-tls")]
+    #[cfg(feature = "doh")]
     fn doh_test_client(tls: &test_tls::TestTls) -> reqwest::Client {
         let cert = reqwest::Certificate::from_pem(&tls.cert_pem).expect("failed to parse generated test cert as PEM");
         reqwest::Client::builder()
@@ -1181,7 +1181,7 @@ mod tests {
             .expect("failed to build test reqwest client")
     }
 
-    #[cfg(feature = "doh-tls")]
+    #[cfg(feature = "doh")]
     #[tokio::test]
     async fn doh_retries_once_after_a_body_read_failure_then_succeeds() {
         let tls = test_tls::generate("127.0.0.1");
@@ -1195,7 +1195,7 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 2, "exactly one retry should have been attempted");
     }
 
-    #[cfg(feature = "doh-tls")]
+    #[cfg(feature = "doh")]
     #[tokio::test]
     async fn doh_does_not_retry_a_real_http_error_status() {
         let tls = test_tls::generate("127.0.0.1");

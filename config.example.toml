@@ -1,4 +1,4 @@
-# Example config for default DoT + TLS DoH build.
+# Example config for default TLS DoT + DoH build.
 # Copy to config.toml (or pass --config <path>) and adjust for your deployment.
 # Serverless build uses environment variables instead; see README.md.
 

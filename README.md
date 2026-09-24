@@ -74,20 +74,39 @@ cargo build --release
 Binding 853/443 without root needs `cap_net_bind_service` on the binary, or
 just use high ports in `config.toml`.
 
-## Serverless (Fly, Cloud Run, etc.)
+## Platform TLS (Fly, Cloud Run, Azure, etc.)
 
-A separate build that serves **plaintext HTTP DoH** behind a platform that
-terminates TLS for you. No certificate, no config file — everything comes from
-environment variables.
+The server can expose plaintext internal listeners for platforms that terminate
+TLS at the edge. `serverless` selects environment-variable configuration;
+`certless` selects plaintext inbound transports; `dot` and `doh` independently
+select protocols. Outbound queries remain encrypted.
+
+The published serverless image enables all four features and listens on
+`0.0.0.0:8853` for DNS-over-TCP and `0.0.0.0:${PORT:-8053}` for HTTP DoH:
 
 ```sh
-docker run --rm -p 8053:8053 ghcr.io/legitcamper/dns-rs-serverless:latest
+docker run --rm -p 8853:8853 -p 8053:8053 \
+  ghcr.io/legitcamper/dns-rs-serverless:latest
 ```
 
-Listens on `0.0.0.0:${PORT:-8053}`; `GET /healthz` returns `ok`.
+**Do not expose these listeners directly to an untrusted network.** They are
+only safe behind a TLS-terminating proxy.
 
-**Do not expose this listener to an untrusted network directly** — it has no
-TLS of its own. It is only safe behind a TLS-terminating proxy.
+### Fly.io
+
+`fly.toml` maps public DoH 443 and DoT 853 to those internal listeners, uses
+Fly-managed certificates, and keeps one Machine running to avoid DNS cold
+starts:
+
+```sh
+fly launch --no-deploy
+fly certs add dns.example.com
+fly deploy
+```
+
+Set your Fly app name and primary region during `fly launch`; the checked-in config
+intentionally omits account-specific values. Clients use
+`https://dns.example.com/dns-query` for DoH and `dns.example.com:853` for DoT.
 
 <details>
 <summary>Environment variables</summary>
@@ -95,7 +114,9 @@ TLS of its own. It is only safe behind a TLS-terminating proxy.
 | Variable | Default |
 |---|---|
 | `PORT` / `DNSRS_DOH_PORT` | `8053` (`PORT` wins) |
+| `DNSRS_DOT_PORT` | `8853` |
 | `DNSRS_BIND_ADDRESS` | `0.0.0.0` |
+| `DNSRS_TLS_CERT`, `DNSRS_TLS_KEY` | required only without `certless` |
 | `DNSRS_UPSTREAM_URLS` | `https://cloudflare-dns.com/dns-query` |
 | `DNSRS_UPSTREAM_STRATEGY` | `hedged` (`sequential`, `hedged`, or `race`) |
 | `DNSRS_BLOCKLIST_URLS`, `DNSRS_BLOCKLIST_DOMAINS` | empty comma-separated lists |
@@ -104,15 +125,19 @@ TLS of its own. It is only safe behind a TLS-terminating proxy.
 | `DNSRS_BLOCK_MODE`, `DNSRS_SINKHOLE_IP` | `nxdomain`, `0.0.0.0` |
 | `DNSRS_STATIC_HOSTS` | empty; format `name=ip,name2=ip2` |
 | `DNSRS_CACHE_ENABLED` | `true` |
-| `DNSRS_CACHE_MAX_SIZE_BYTES` | ¼ of the cgroup memory limit, clamped to 1–64 MiB (64 MiB when no limit is discoverable); ceiling 1 GiB |
+| `DNSRS_CACHE_MAX_SIZE_BYTES` | ¼ of cgroup memory, clamped to 1–64 MiB; ceiling 1 GiB |
 | `DNSRS_DEFAULT_TTL` | `300` |
 
-Build it yourself with:
+Build the Fly profile:
 
 ```sh
-docker build --build-arg 'CARGO_ARGS=--no-default-features --features serverless' \
+docker build \
+  --build-arg 'CARGO_ARGS=--no-default-features --features serverless,certless,dot,doh' \
   -t dns-rs-serverless .
 ```
+
+A DoH-only platform profile (for example Azure) uses
+`--no-default-features --features serverless,certless,doh`.
 
 </details>
 

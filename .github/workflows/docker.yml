@@ -39,10 +39,9 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
   serverless:
-    # Same Dockerfile, different cargo feature set: plaintext DoH behind a
-    # platform TLS terminator, env-var config, no DoT. A separate image rather
-    # than a runtime flag because the feature guards in src/main.rs make
-    # "plaintext on the TLS ports" unrepresentable at compile time.
+    # Environment-configured, plaintext DoT + DoH behind a platform TLS
+    # terminator. Protocol selection and certificate termination are separate
+    # features so platforms that only support DoH can build a smaller profile.
     uses: docker/github-builder/.github/workflows/build.yml@v1
     permissions:
       contents: read
@@ -59,7 +58,7 @@ jobs:
       # sharing the default build's cache would thrash it.
       cache-scope: serverless
       build-args: |
-        CARGO_ARGS=--no-default-features --features serverless
+        CARGO_ARGS=--no-default-features --features serverless,certless,dot,doh
       set-meta-labels: true
       # Its own package, so the tag ladder matches the default image's exactly
       # rather than carrying a suffix.

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(not(feature = "serverless"))]
 use std::path::Path;
-#[cfg(any(feature = "dot", feature = "doh-tls"))]
+#[cfg(all(not(feature = "certless"), any(feature = "dot", feature = "doh")))]
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -35,11 +35,12 @@ pub struct ServerConfig {
     #[cfg(feature = "dot")]
     #[serde(default = "default_dot_port")]
     pub dot_port: u16,
+    #[cfg(feature = "doh")]
     #[serde(default = "default_doh_port")]
     pub doh_port: u16,
-    #[cfg(any(feature = "dot", feature = "doh-tls"))]
+    #[cfg(all(not(feature = "certless"), any(feature = "dot", feature = "doh")))]
     pub tls_cert: PathBuf,
-    #[cfg(any(feature = "dot", feature = "doh-tls"))]
+    #[cfg(all(not(feature = "certless"), any(feature = "dot", feature = "doh")))]
     pub tls_key: PathBuf,
     #[serde(default = "default_ttl")]
     pub default_ttl: u32,
@@ -51,6 +52,7 @@ impl ServerConfig {
         SocketAddr::new(self.bind_address, self.dot_port)
     }
 
+    #[cfg(feature = "doh")]
     pub fn doh_listen(&self) -> SocketAddr {
         SocketAddr::new(self.bind_address, self.doh_port)
     }
@@ -62,13 +64,16 @@ fn default_bind_address() -> IpAddr {
 
 #[cfg(feature = "dot")]
 fn default_dot_port() -> u16 {
-    853
+    if cfg!(feature = "certless") {
+        8853
+    } else {
+        853
+    }
 }
 
+#[cfg(feature = "doh")]
 fn default_doh_port() -> u16 {
-    // Plaintext listener gets a high port: no cap_net_bind_service needed, and
-    // it isn't meant to be the public 443 endpoint anyway.
-    if cfg!(not(feature = "doh-tls")) {
+    if cfg!(feature = "certless") {
         8053
     } else {
         443
@@ -387,7 +392,18 @@ impl Config {
         let mut config = Config {
             server: ServerConfig {
                 bind_address: default_bind_address(),
+                #[cfg(feature = "dot")]
+                dot_port: default_dot_port(),
+                #[cfg(feature = "doh")]
                 doh_port: default_doh_port(),
+                #[cfg(all(not(feature = "certless"), any(feature = "dot", feature = "doh")))]
+                tls_cert: value("DNSRS_TLS_CERT")?
+                    .map(PathBuf::from)
+                    .context("DNSRS_TLS_CERT is required when certless is disabled")?,
+                #[cfg(all(not(feature = "certless"), any(feature = "dot", feature = "doh")))]
+                tls_key: value("DNSRS_TLS_KEY")?
+                    .map(PathBuf::from)
+                    .context("DNSRS_TLS_KEY is required when certless is disabled")?,
                 default_ttl: default_ttl(),
             },
             blocking: BlockingConfig::default(),
@@ -404,6 +420,11 @@ impl Config {
         if let Some(bind_address) = parse("DNSRS_BIND_ADDRESS")? {
             config.server.bind_address = bind_address;
         }
+        #[cfg(feature = "dot")]
+        if let Some(port) = parse("DNSRS_DOT_PORT")? {
+            config.server.dot_port = port;
+        }
+        #[cfg(feature = "doh")]
         if let Some(port) = match parse("PORT")? {
             Some(port) => Some(port),
             None => parse("DNSRS_DOH_PORT")?,
@@ -490,21 +511,21 @@ impl Config {
             bail!("config must define at least one entry in [upstream] urls");
         }
         self.parsed_upstreams()?;
-        #[cfg(any(feature = "dot", feature = "doh-tls"))]
+        #[cfg(all(not(feature = "certless"), any(feature = "dot", feature = "doh")))]
         if !self.server.tls_cert.is_file() {
             bail!(
                 "server.tls_cert does not point to a file: {}",
                 self.server.tls_cert.display()
             );
         }
-        #[cfg(any(feature = "dot", feature = "doh-tls"))]
+        #[cfg(all(not(feature = "certless"), any(feature = "dot", feature = "doh")))]
         if !self.server.tls_key.is_file() {
             bail!(
                 "server.tls_key does not point to a file: {}",
                 self.server.tls_key.display()
             );
         }
-        #[cfg(feature = "dot")]
+        #[cfg(all(feature = "dot", feature = "doh"))]
         if self.server.dot_port == self.server.doh_port {
             bail!("server.dot_port and server.doh_port must be different");
         }
@@ -561,7 +582,10 @@ mod tests {
     #[test]
     fn from_env_defaults_then_overrides() {
         let base = Config::from_env().expect("no env vars must still yield a valid config");
+        #[cfg(feature = "doh")]
         assert_eq!(base.server.doh_port, 8053);
+        #[cfg(feature = "dot")]
+        assert_eq!(base.server.dot_port, 8853);
         assert_eq!(base.server.bind_address.to_string(), "0.0.0.0");
         assert_eq!(
             base.upstream.urls,
@@ -574,8 +598,12 @@ mod tests {
 
         // SAFETY: this process runs no other test that touches DNSRS_*/PORT.
         unsafe {
+            #[cfg(feature = "doh")]
             std::env::set_var("PORT", "9000");
+            #[cfg(feature = "doh")]
             std::env::set_var("DNSRS_DOH_PORT", "9001");
+            #[cfg(feature = "dot")]
+            std::env::set_var("DNSRS_DOT_PORT", "9002");
             std::env::set_var(
                 "DNSRS_UPSTREAM_URLS",
                 "tls://1.1.1.1:853, https://dns.google/dns-query",
@@ -589,10 +617,13 @@ mod tests {
         }
 
         let overridden = Config::from_env().expect("overrides must validate");
+        #[cfg(feature = "doh")]
         assert_eq!(
             overridden.server.doh_port, 9000,
             "PORT must win over DNSRS_DOH_PORT"
         );
+        #[cfg(feature = "dot")]
+        assert_eq!(overridden.server.dot_port, 9002);
         assert_eq!(overridden.upstream.urls.len(), 2);
         assert_eq!(overridden.upstream.strategy, UpstreamStrategy::Race);
         assert_eq!(overridden.blocking.mode, BlockMode::Sinkhole);

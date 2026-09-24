@@ -1,18 +1,12 @@
-#[cfg(all(feature = "serverless", any(feature = "dot", feature = "doh-tls")))]
-compile_error!("serverless cannot be combined with dot or doh-tls");
-#[cfg(all(not(feature = "doh-tls"), not(feature = "serverless")))]
-compile_error!(
-    "plaintext DoH is only meant for the serverless profile: \
-     keep the doh-tls default feature, or build \
-     --no-default-features --features serverless"
-);
+#[cfg(not(any(feature = "dot", feature = "doh")))]
+compile_error!("enable at least one listener feature: dot or doh");
 
 mod blocklist;
 mod config;
 mod dns;
 mod server;
 mod state;
-#[cfg(feature = "dot")]
+#[cfg(all(feature = "dot", not(feature = "certless")))]
 mod tls;
 mod util;
 
@@ -178,36 +172,43 @@ async fn spawn_listeners(config: &Config, shutdown: CancellationToken) -> Result
 
     #[cfg(feature = "dot")]
     {
-        let tls_config = tls::load_server_config(&config.server.tls_cert, &config.server.tls_key)?;
         let addr = config.server.dot_listen();
         let state = Arc::clone(&state);
         let shutdown = shutdown.clone();
+        #[cfg(not(feature = "certless"))]
+        let tls_config = tls::load_server_config(&config.server.tls_cert, &config.server.tls_key)?;
         listeners.push((
             "DoT",
-            tokio::spawn(
-                async move { server::dot::serve(addr, tls_config, state, shutdown).await },
-            ),
+            tokio::spawn(async move {
+                #[cfg(feature = "certless")]
+                return server::dot::serve(addr, state, shutdown).await;
+                #[cfg(not(feature = "certless"))]
+                server::dot::serve(addr, tls_config, state, shutdown).await
+            }),
         ));
     }
 
-    let addr = config.server.doh_listen();
-    let state = Arc::clone(&state);
-    #[cfg(feature = "doh-tls")]
+    #[cfg(feature = "doh")]
     {
-        let cert = config.server.tls_cert.clone();
-        let key = config.server.tls_key.clone();
+        let addr = config.server.doh_listen();
+        let state = Arc::clone(&state);
+        #[cfg(not(feature = "certless"))]
+        {
+            let cert = config.server.tls_cert.clone();
+            let key = config.server.tls_key.clone();
+            listeners.push((
+                "DoH",
+                tokio::spawn(async move {
+                    server::doh::serve(addr, &cert, &key, state, shutdown).await
+                }),
+            ));
+        }
+        #[cfg(feature = "certless")]
         listeners.push((
             "DoH",
-            tokio::spawn(
-                async move { server::doh::serve(addr, &cert, &key, state, shutdown).await },
-            ),
+            tokio::spawn(async move { server::doh::serve(addr, state, shutdown).await }),
         ));
     }
-    #[cfg(not(feature = "doh-tls"))]
-    listeners.push((
-        "DoH",
-        tokio::spawn(async move { server::doh::serve(addr, state, shutdown).await }),
-    ));
 
     Ok(listeners)
 }

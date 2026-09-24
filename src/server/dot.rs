@@ -1,12 +1,14 @@
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Semaphore};
+use anyhow::{Context, Result, bail};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::time::timeout;
+#[cfg(not(feature = "certless"))]
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -20,7 +22,7 @@ const MAX_MESSAGE_SIZE: usize = 65535;
 
 /// Caps how many queries a single DoT connection may have resolving at
 /// once. Pipelined queries are processed concurrently (see
-/// `handle_connection`), so without a limit a connection that pipelines a
+/// `handle_stream`), so without a limit a connection that pipelines a
 /// large burst could spawn unbounded concurrent upstream fetches; this
 /// makes the reader loop itself apply backpressure (stop reading further
 /// queries off the socket) once the limit is reached, rather than buffering
@@ -45,20 +47,69 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// should finish in milliseconds, not seconds.
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
+type BoxedStream = Box<dyn AsyncReadWrite>;
+
+trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
+
 /// RFC 7858 DNS-over-TLS listener, 2-byte length-prefixed framing (same as
 /// classic DNS-over-TCP); a connection may carry multiple pipelined queries.
 /// Stops accepting new connections once `shutdown` fires; already-accepted
 /// ones finish on their own.
+#[cfg(not(feature = "certless"))]
 pub async fn serve(
     addr: SocketAddr,
     tls_config: Arc<rustls::ServerConfig>,
     state: Arc<AppState>,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    let acceptor = TlsAcceptor::from(tls_config);
+    serve_listener(
+        addr,
+        move |tcp| {
+            let acceptor = acceptor.clone();
+            async move {
+                acceptor
+                    .accept(tcp)
+                    .await
+                    .map(|stream| Box::new(stream) as BoxedStream)
+                    .context("TLS handshake failed")
+            }
+        },
+        state,
+        shutdown,
+    )
+    .await
+}
+
+#[cfg(feature = "certless")]
+pub async fn serve(
+    addr: SocketAddr,
+    state: Arc<AppState>,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    serve_listener(
+        addr,
+        |tcp| async move { Ok(Box::new(tcp) as BoxedStream) },
+        state,
+        shutdown,
+    )
+    .await
+}
+
+async fn serve_listener<F, S>(
+    addr: SocketAddr,
+    wrap: F,
+    state: Arc<AppState>,
+    shutdown: CancellationToken,
+) -> Result<()>
+where
+    F: Fn(tokio::net::TcpStream) -> S + Clone + Send + Sync + 'static,
+    S: Future<Output = Result<BoxedStream>> + Send + 'static,
+{
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind DoT listener on {addr}"))?;
-    let acceptor = TlsAcceptor::from(tls_config);
     let connections = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     info!(%addr, "DoT listener ready");
 
@@ -77,23 +128,22 @@ pub async fn serve(
             },
         };
 
-        // Rejected outright rather than queued: a flood of connections that
-        // may never even complete a TLS handshake shouldn't be able to make
-        // legitimate clients wait behind them.
         let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else {
             debug!(%peer, "DoT connection limit reached, rejecting");
             continue;
         };
 
-        // Without this, Nagle's algorithm can hold small DNS responses back
-        // waiting to coalesce with more outbound data, adding tens of
-        // milliseconds of pure buffering delay per query for no benefit here.
         tcp.set_nodelay(true).ok();
-        let acceptor = acceptor.clone();
+        let wrap = wrap.clone();
         let state = Arc::clone(&state);
         tokio::spawn(async move {
-            let _permit = permit; // held for the connection's lifetime, released on drop
-            if let Err(err) = handle_connection(acceptor, tcp, state).await {
+            let _permit = permit;
+            let result = async {
+                let stream = wrap(tcp).await?;
+                handle_stream(stream, state).await
+            }
+            .await;
+            if let Err(err) = result {
                 debug!(%peer, error = %err, "DoT connection ended");
             }
         });
@@ -108,9 +158,11 @@ pub async fn serve(
 /// each response as soon as it's ready - responses may therefore complete
 /// out of request order, same as any other pipelined DNS-over-TCP
 /// implementation; the client matches them back up by message ID.
-async fn handle_connection(acceptor: TlsAcceptor, tcp: TcpStream, state: Arc<AppState>) -> Result<()> {
-    let tls = acceptor.accept(tcp).await.context("TLS handshake failed")?;
-    let (mut read_half, mut write_half) = tokio::io::split(tls);
+async fn handle_stream<S>(stream: S, state: Arc<AppState>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut read_half, mut write_half) = tokio::io::split(stream);
 
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(MAX_CONCURRENT_QUERIES_PER_CONNECTION);
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES_PER_CONNECTION));

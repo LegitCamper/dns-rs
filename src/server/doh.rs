@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-#[cfg(feature = "doh-tls")]
+#[cfg(not(feature = "certless"))]
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,7 +11,7 @@ use axum::extract::{Query as AxumQuery, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-#[cfg(feature = "doh-tls")]
+#[cfg(not(feature = "certless"))]
 use axum_server::tls_rustls::RustlsConfig;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -61,7 +61,7 @@ fn app(state: Arc<AppState>) -> Router {
 /// RFC 8484 DNS-over-HTTPS listener on every path except `/healthz`, supporting
 /// both the GET form (`?dns=<base64url>`) and POST form (raw wire bytes as body).
 /// axum-server negotiates HTTP/1.1 or h2 over ALPN automatically.
-#[cfg(feature = "doh-tls")]
+#[cfg(not(feature = "certless"))]
 pub async fn serve(
     addr: SocketAddr,
     cert: &Path,
@@ -104,7 +104,7 @@ pub async fn serve(
     Ok(())
 }
 
-#[cfg(not(feature = "doh-tls"))]
+#[cfg(feature = "certless")]
 pub async fn serve(
     addr: SocketAddr,
     state: Arc<AppState>,

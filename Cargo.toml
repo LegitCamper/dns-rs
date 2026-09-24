@@ -4,10 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["dot", "doh-tls"]
+default = ["dot", "doh"]
 dot = ["dep:rustls-pemfile"]
-doh-tls = ["axum-server/tls-rustls"]
+doh = ["axum-server/tls-rustls"]
 serverless = []
+certless = []
 
 [dependencies]
 anyhow = "1.0.104"

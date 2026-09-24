@@ -11,11 +11,11 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 /// client connector that trusts exactly that cert (nothing else).
 pub(crate) struct TestTls {
     pub server_name: ServerName<'static>,
-    #[cfg(feature = "doh-tls")]
+    #[cfg(feature = "doh")]
     pub server_config: Arc<rustls::ServerConfig>,
     /// PEM-encoded cert, for handing to `reqwest::Certificate::from_pem` in
     /// DoH tests (reqwest doesn't take a rustls `RootCertStore` directly).
-    #[cfg(feature = "doh-tls")]
+    #[cfg(feature = "doh")]
     pub cert_pem: Vec<u8>,
     pub acceptor: TlsAcceptor,
     pub connector: TlsConnector,
@@ -30,7 +30,7 @@ pub(crate) fn generate(name: &str) -> TestTls {
         rcgen::generate_simple_self_signed([name.to_string()])
             .expect("failed to generate self-signed test cert");
 
-    #[cfg(feature = "doh-tls")]
+    #[cfg(feature = "doh")]
     let cert_pem = cert.pem().into_bytes();
     let cert_der = CertificateDer::from(cert.der().to_vec());
     let key_der =
@@ -55,9 +55,9 @@ pub(crate) fn generate(name: &str) -> TestTls {
         server_name: ServerName::try_from(name.to_string()).expect("invalid test server name"),
         acceptor: TlsAcceptor::from(Arc::clone(&server_config)),
         connector: TlsConnector::from(Arc::new(client_config)),
-        #[cfg(feature = "doh-tls")]
+        #[cfg(feature = "doh")]
         server_config,
-        #[cfg(feature = "doh-tls")]
+        #[cfg(feature = "doh")]
         cert_pem,
     }
 }
