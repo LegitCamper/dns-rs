@@ -45,6 +45,18 @@ use crate::state::AppState;
 
 const DNS_MESSAGE_CONTENT_TYPE: &str = "application/dns-message";
 
+/// CORS for browser-based DoH clients (test pages, JS resolvers). A public
+/// resolver has no origin-derived authority and no cookies/auth, so `*` with
+/// credentials disallowed leaks nothing a direct fetch couldn't already get.
+/// ponytail: fixed `*` rather than a configurable allowlist; swap in a
+/// config-driven origin check if this ever grows authenticated endpoints.
+const CORS_HEADERS: [(header::HeaderName, &str); 4] = [
+    (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+    (header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS"),
+    (header::ACCESS_CONTROL_ALLOW_HEADERS, "content-type, accept"),
+    (header::ACCESS_CONTROL_MAX_AGE, "86400"),
+];
+
 #[derive(Deserialize)]
 struct DohGetParams {
     dns: String,
@@ -52,9 +64,12 @@ struct DohGetParams {
 
 fn app(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/dns-query", get(handle_get).post(handle_post))
+        .route(
+            "/dns-query",
+            get(handle_get).post(handle_post).options(handle_options),
+        )
         .route("/healthz", get(|| async { "ok" }))
-        .fallback(get(handle_get).post(handle_post))
+        .fallback(get(handle_get).post(handle_post).options(handle_options))
         .with_state(state)
 }
 
@@ -137,13 +152,20 @@ pub async fn serve(
     Ok(())
 }
 
+/// Preflight. Answered for any path the query handlers accept, since a
+/// browser sends OPTIONS before a POST with `content-type:
+/// application/dns-message` (not a CORS-safelisted value).
+async fn handle_options() -> Response {
+    (StatusCode::NO_CONTENT, CORS_HEADERS).into_response()
+}
+
 async fn handle_get(
     State(state): State<Arc<AppState>>,
     AxumQuery(params): AxumQuery<DohGetParams>,
 ) -> Response {
     match URL_SAFE_NO_PAD.decode(params.dns.as_bytes()) {
         Ok(bytes) => respond(&state, &bytes).await,
-        Err(_) => StatusCode::BAD_REQUEST.into_response(),
+        Err(_) => (StatusCode::BAD_REQUEST, CORS_HEADERS).into_response(),
     }
 }
 
@@ -156,7 +178,28 @@ async fn respond(state: &Arc<AppState>, query_bytes: &[u8]) -> Response {
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, DNS_MESSAGE_CONTENT_TYPE)],
+        CORS_HEADERS,
         response_bytes,
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Preflight must carry all four CORS headers, or a browser rejects the
+    /// subsequent POST before it is ever sent.
+    #[tokio::test]
+    async fn options_returns_cors_headers() {
+        let response = handle_options().await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        for (name, value) in CORS_HEADERS {
+            assert_eq!(
+                response.headers().get(&name).map(|v| v.to_str().unwrap()),
+                Some(value),
+                "missing or wrong {name}"
+            );
+        }
+    }
 }
