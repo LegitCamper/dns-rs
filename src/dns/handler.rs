@@ -231,7 +231,7 @@ mod tests {
     fn build_state<U: Upstream>(upstreams: Vec<U>, strategy: Strategy) -> Arc<AppState<U>> {
         Arc::new(AppState {
             static_hosts: rustc_hash::FxHashMap::default(),
-            blocklist: Arc::new(ArcSwap::from_pointee(rustc_hash::FxHashSet::default())),
+            blocklist: Arc::new(ArcSwap::from_pointee(crate::blocklist::DomainIndex::new())),
             cache: Arc::new(ResponseCache::new(true, 65536)),
             in_flight: InFlightRegistry::new(),
             upstreams: MultiUpstream::new(upstreams, strategy),
