@@ -24,20 +24,24 @@ protocol layer), and exercises:
     scanners hitting port 853 actually produce)
 
 Usage:
-    uv run tests/e2e/harness.py [smoke|durability|cache|memory|dot-limits|all ...]
+    uv run tests/e2e/harness.py [smoke|durability|cache|memory|dot-limits|perf-local|perf-live|all ...]
 
-Requires `cargo build --release` to have been run first, and outbound
-network access to a public DoH/DoT resolver (Cloudflare) for the tests that
-need a real upstream.
+Local scenarios require `cargo build --release` (or `DNSRS_E2E_BINARY`) and
+some require outbound access to a public DoH/DoT resolver. Performance modes
+are opt-in; `all` preserves the existing correctness scenario set.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import datetime
+import hashlib
 import http.server
 import json
 import os
+import platform
+import random
 import shutil
 import signal
 import socket
@@ -46,8 +50,10 @@ import subprocess
 import sys
 import threading
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Awaitable, Callable
 
 import dns.message
 import dns.rcode
@@ -55,7 +61,7 @@ import dns.rdatatype
 import httpx
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-BINARY = REPO_ROOT / "target" / "release" / "dns-rs"
+BINARY = Path(os.environ.get("DNSRS_E2E_BINARY", REPO_ROOT / "target" / "release" / "dns-rs")).expanduser().resolve()
 CERTS_DIR = Path(__file__).resolve().parent / "certs"
 CERT_PATH = CERTS_DIR / "cert.pem"
 KEY_PATH = CERTS_DIR / "key.pem"
@@ -63,6 +69,42 @@ RUN_DIR = Path(__file__).resolve().parent / ".run"
 
 REAL_UPSTREAM_DOH = "https://cloudflare-dns.com/dns-query"
 REAL_UPSTREAM_DOT = "tls://1.1.1.1:853#cloudflare-dns.com"
+LIVE_DOT_TARGETS = {
+    "dns-rs-fly": (
+        os.environ.get("E2E_PERF_FLY_HOST", "dns-rs-cold-hollow-7445.fly.dev"),
+        853,
+        os.environ.get("E2E_PERF_FLY_HOST", "dns-rs-cold-hollow-7445.fly.dev"),
+    ),
+    "cloudflare": (os.environ.get("E2E_PERF_CLOUDFLARE_IP", "1.1.1.1"), 853, "cloudflare-dns.com"),
+}
+PERF_REQUESTS = int(os.environ.get("E2E_PERF_REQUESTS", "50"))
+PERF_WARMUP = int(os.environ.get("E2E_PERF_WARMUP", "10"))
+PERF_LIVE_RATE = float(os.environ.get("E2E_PERF_LIVE_RATE", "1"))
+PERF_SEED = int(os.environ.get("E2E_PERF_SEED", "20260413"))
+
+
+@dataclass
+class PerfOptions:
+    binary_a: Path = BINARY
+    binary_b: Path | None = None
+    label_a: str = "baseline"
+    label_b: str = "candidate"
+    output: Path | None = None
+    seed: int = PERF_SEED
+    rounds: int = 8
+    requests: int = PERF_REQUESTS
+    warmup: int = PERF_WARMUP
+    concurrency: int = 8
+    timeout: float = 8.0
+    live_rate: float = PERF_LIVE_RATE
+    fly_host: str = os.environ.get("E2E_PERF_FLY_HOST", "dns-rs-cold-hollow-7445.fly.dev")
+    fly_doh_url: str = ""
+    cloudflare_dot_host: str = os.environ.get("E2E_PERF_CLOUDFLARE_IP", "1.1.1.1")
+    cloudflare_doh_url: str = REAL_UPSTREAM_DOH
+    sweep_seconds: float = 31.0
+
+
+PERF_OPTIONS = PerfOptions()
 
 UPSTREAM_TIMEOUT = 5.0  # must match dns-rs's own UPSTREAM_TIMEOUT constant
 
@@ -117,7 +159,14 @@ def free_port() -> int:
 
 def ensure_certs() -> None:
     if CERT_PATH.exists() and KEY_PATH.exists():
-        return
+        valid = subprocess.run(
+            ["openssl", "x509", "-checkend", "0", "-noout", "-in", str(CERT_PATH)],
+            capture_output=True,
+        ).returncode == 0
+        if valid:
+            return
+        CERT_PATH.unlink()
+        KEY_PATH.unlink()
     CERTS_DIR.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         [
@@ -242,13 +291,25 @@ max_size_bytes = {cache_max_bytes}
 
 
 class DnsRsServer:
-    def __init__(self, name: str, config_text: str, rust_log: str = "dns_rs=debug"):
+    def __init__(
+        self,
+        name: str,
+        config_text: str,
+        rust_log: str = "dns_rs=debug",
+        *,
+        binary: Path | None = None,
+        ports: tuple[int, int] | None = None,
+    ):
         self.name = name
         self.config_text = config_text
         self.rust_log = rust_log
+        self.binary = binary or BINARY
+        self.ports = ports
         self.proc: subprocess.Popen | None = None
         self.logs: list[str] = []
         self._log_thread: threading.Thread | None = None
+        self.returncode: int | None = None
+        self.forced_kill = False
 
     def __enter__(self) -> "DnsRsServer":
         run_dir = RUN_DIR / self.name
@@ -259,7 +320,7 @@ class DnsRsServer:
         env = os.environ.copy()
         env["RUST_LOG"] = self.rust_log
         self.proc = subprocess.Popen(
-            [str(BINARY), "--config", str(config_path)],
+            [str(self.binary), "--config", str(config_path)],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env,
         )
         self._log_thread = threading.Thread(target=self._drain_logs, daemon=True)
@@ -274,14 +335,20 @@ class DnsRsServer:
 
     def _wait_ready(self, timeout: float) -> None:
         deadline = time.time() + timeout
-        seen: set[str] = set()
+        ports = set(self.ports or ())
+        if not ports:
+            for line in self.config_text.splitlines():
+                key, _, value = line.partition("=")
+                if key.strip() in {"dot_port", "doh_port"}:
+                    ports.add(int(value.strip()))
+        ready: set[int] = set()
         while time.time() < deadline:
-            for line in self.logs:
-                if "DoT listener ready" in line:
-                    seen.add("dot")
-                if "DoH listener ready" in line:
-                    seen.add("doh")
-            if {"dot", "doh"} <= seen:
+            for port in ports - ready:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                    probe.settimeout(0.1)
+                    if probe.connect_ex(("127.0.0.1", port)) == 0:
+                        ready.add(port)
+            if ready == ports:
                 return
             if self.proc.poll() is not None:
                 raise RuntimeError(f"{self.name}: server exited early (code {self.proc.returncode}):\n" + "\n".join(self.logs))
@@ -294,25 +361,43 @@ class DnsRsServer:
             try:
                 self.proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
+                self.forced_kill = True
                 self.proc.kill()
                 self.proc.wait()
+        if self.proc:
+            self.returncode = self.proc.returncode
         if self._log_thread:
             self._log_thread.join(timeout=2)
 
     def is_alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
-    def rss_kb(self) -> int | None:
+    def resource_snapshot(self) -> dict | None:
         if not self.proc:
             return None
         try:
-            with open(f"/proc/{self.proc.pid}/status") as f:
-                for line in f:
-                    if line.startswith("VmRSS:"):
-                        return int(line.split()[1])
-        except (FileNotFoundError, ProcessLookupError):
+            stat = Path(f"/proc/{self.proc.pid}/stat").read_text().split()
+            status = {}
+            for line in Path(f"/proc/{self.proc.pid}/status").read_text().splitlines():
+                key, separator, value = line.partition(":")
+                if separator:
+                    status[key] = value.strip()
+            ticks = os.sysconf("SC_CLK_TCK")
+            return {
+                "user_cpu_s": int(stat[13]) / ticks,
+                "system_cpu_s": int(stat[14]) / ticks,
+                "rss_kb": int(status["VmRSS"].split()[0]) if "VmRSS" in status else None,
+                "peak_rss_kb": int(status["VmHWM"].split()[0]) if "VmHWM" in status else None,
+                "threads": int(status["Threads"]) if "Threads" in status else None,
+                "voluntary_context_switches": int(status["voluntary_ctxt_switches"]) if "voluntary_ctxt_switches" in status else None,
+                "involuntary_context_switches": int(status["nonvoluntary_ctxt_switches"]) if "nonvoluntary_ctxt_switches" in status else None,
+            }
+        except (FileNotFoundError, KeyError, ProcessLookupError, ValueError):
             return None
-        return None
+
+    def rss_kb(self) -> int | None:
+        snapshot = self.resource_snapshot()
+        return snapshot["rss_kb"] if snapshot else None
 
     def log_count(self, substr: str) -> int:
         return sum(1 for l in self.logs if substr in l)
@@ -332,6 +417,90 @@ class DnsRsServer:
 # --------------------------------------------------------------------------
 # DNS query helpers (real DoT/DoH sockets, no shortcuts)
 # --------------------------------------------------------------------------
+
+
+class PersistentDotClient:
+    """Multiplexed DoT client that keeps one TLS connection open."""
+
+    def __init__(self, host: str, port: int, server_hostname: str, ssl_context: ssl.SSLContext, timeout: float = 8.0):
+        self.host = host
+        self.port = port
+        self.server_hostname = server_hostname
+        self.ssl_context = ssl_context
+        self.timeout = timeout
+        self.reader: asyncio.StreamReader | None = None
+        self.writer: asyncio.StreamWriter | None = None
+        self._reader_task: asyncio.Task | None = None
+        self._write_lock = asyncio.Lock()
+        self._pending: dict[int, asyncio.Future] = {}
+        self._next_id = 0
+        self.connection_ms: float | None = None
+
+    async def __aenter__(self) -> "PersistentDotClient":
+        started = time.perf_counter_ns()
+        self.reader, self.writer = await asyncio.wait_for(
+            asyncio.open_connection(
+                self.host,
+                self.port,
+                ssl=self.ssl_context,
+                server_hostname=self.server_hostname,
+            ),
+            timeout=self.timeout,
+        )
+        self.connection_ms = (time.perf_counter_ns() - started) / 1_000_000
+        self._reader_task = asyncio.create_task(self._read_responses())
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        if self.writer:
+            self.writer.close()
+            try:
+                await self.writer.wait_closed()
+            except (ConnectionError, ssl.SSLError):
+                pass
+        if self._reader_task:
+            self._reader_task.cancel()
+            await asyncio.gather(self._reader_task, return_exceptions=True)
+
+    def _allocate_id(self) -> int:
+        for _ in range(65_536):
+            self._next_id = (self._next_id + 1) & 0xFFFF
+            if self._next_id not in self._pending:
+                return self._next_id
+        raise RuntimeError("all DNS request IDs are in flight")
+
+    async def _read_responses(self) -> None:
+        assert self.reader is not None
+        try:
+            while True:
+                length_bytes = await self.reader.readexactly(2)
+                length = int.from_bytes(length_bytes, "big")
+                response = dns.message.from_wire(await self.reader.readexactly(length))
+                future = self._pending.pop(response.id, None)
+                if future is not None and not future.done():
+                    future.set_result(response)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            for future in self._pending.values():
+                if not future.done():
+                    future.set_exception(exc)
+            self._pending.clear()
+
+    async def query(self, query: dns.message.Message) -> dns.message.Message:
+        assert self.writer is not None
+        query.id = self._allocate_id()
+        future = asyncio.get_running_loop().create_future()
+        self._pending[query.id] = future
+        wire = query.to_wire()
+        try:
+            async with self._write_lock:
+                self.writer.write(len(wire).to_bytes(2, "big") + wire)
+                await asyncio.wait_for(self.writer.drain(), timeout=self.timeout)
+            return await asyncio.wait_for(future, timeout=self.timeout)
+        except BaseException:
+            self._pending.pop(query.id, None)
+            raise
 
 
 async def dot_query(port: int, query: dns.message.Message, timeout: float = 8.0) -> dns.message.Message:
@@ -970,6 +1139,615 @@ async def scenario_dot_connection_limits() -> bool:
 
 
 # --------------------------------------------------------------------------
+# Scenarios: repeatable performance evidence
+# --------------------------------------------------------------------------
+
+
+def percentile(sorted_values: list[float], p: float) -> float | None:
+    if not sorted_values:
+        return None
+    index = (len(sorted_values) - 1) * p
+    lower = int(index)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    return sorted_values[lower] + (sorted_values[upper] - sorted_values[lower]) * (index - lower)
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def command_text(*command: str) -> str | None:
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=10, check=False)
+        return (result.stdout or result.stderr).strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def binary_metadata(label: str, path: Path) -> dict:
+    return {
+        "label": label,
+        "path": str(path),
+        "sha256": file_sha256(path),
+        "size_bytes": path.stat().st_size,
+    }
+
+
+def metric_delta(before: dict, after: dict, key: str) -> int | float | None:
+    start, end = before.get(key), after.get(key)
+    return end - start if start is not None and end is not None else None
+
+
+def resource_delta(before: dict | None, after: dict | None, successes: int) -> dict | None:
+    if before is None or after is None:
+        return None
+    user = metric_delta(before, after, "user_cpu_s")
+    system = metric_delta(before, after, "system_cpu_s")
+    total = user + system if user is not None and system is not None else None
+    return {
+        "user_cpu_s": user,
+        "system_cpu_s": system,
+        "total_cpu_s": total,
+        "cpu_us_per_success": total * 1_000_000 / successes if total is not None and successes else None,
+        "rss_start_kb": before.get("rss_kb"),
+        "rss_end_kb": after.get("rss_kb"),
+        "peak_rss_kb": after.get("peak_rss_kb"),
+        "threads_end": after.get("threads"),
+        "voluntary_context_switches": metric_delta(before, after, "voluntary_context_switches"),
+        "involuntary_context_switches": metric_delta(before, after, "involuntary_context_switches"),
+    }
+
+
+def validate_dns_response(query: dns.message.Message, response: dns.message.Message, expected_rcode: int, expected_ip: str | None) -> None:
+    if response.id != query.id:
+        raise ValueError(f"response ID mismatch: expected {query.id}, got {response.id}")
+    if len(response.question) != 1 or len(query.question) != 1 or response.question[0] != query.question[0]:
+        raise ValueError("response question does not match request")
+    if response.rcode() != expected_rcode:
+        raise ValueError(f"unexpected rcode: expected {dns.rcode.to_text(expected_rcode)}, got {dns.rcode.to_text(response.rcode())}")
+    if expected_ip is not None:
+        answers = [str(item) for rrset in response.answer for item in rrset]
+        if expected_ip not in answers:
+            raise ValueError(f"expected A answer {expected_ip}, got {answers}")
+
+
+def summarize_samples(name: str, samples: list[dict], elapsed_s: float, *, report: bool = True) -> dict:
+    latencies = [sample["latency_ns"] / 1_000_000 for sample in samples if sample["status"] == "success"]
+    ordered = sorted(latencies)
+    errors = [sample for sample in samples if sample["status"] != "success"]
+    summary = {
+        "name": name,
+        "requests": len(samples),
+        "successes": len(latencies),
+        "error_count": len(errors),
+        "timeout_count": sum(sample["status"] == "timeout" for sample in errors),
+        "validation_failure_count": sum(sample["status"] == "validation_error" for sample in errors),
+        "transport_error_count": sum(sample["status"] == "transport_error" for sample in errors),
+        "errors": errors,
+        "elapsed_s": elapsed_s,
+        "qps": len(latencies) / elapsed_s if elapsed_s else 0.0,
+        "percentiles_ms": {
+            "p50": percentile(ordered, 0.50),
+            "p90": percentile(ordered, 0.90),
+            "p95": percentile(ordered, 0.95),
+            "p99": percentile(ordered, 0.99),
+            "max": ordered[-1] if ordered else None,
+        },
+    }
+    p = summary["percentiles_ms"]
+    if report and ordered:
+        print(f"  {name}: {len(latencies)}/{len(samples)} ok, {summary['qps']:.1f} QPS, p50={p['p50']:.3f}ms p95={p['p95']:.3f}ms p99={p['p99']:.3f}ms")
+    elif report:
+        print(f"  {name}: 0/{len(samples)} ok")
+    return summary
+
+
+async def measure_queries(
+    name: str,
+    query_fn: Callable[[dns.message.Message], Awaitable[dns.message.Message]],
+    plan: list[tuple[str, int, str | None]],
+    *,
+    warmup: int = 0,
+    concurrency: int = 1,
+    rate: float | None = None,
+    report: bool = True,
+) -> dict:
+    for i in range(warmup):
+        query_name, expected_rcode, expected_ip = plan[i % len(plan)]
+        query = make_query(query_name)
+        response = await query_fn(query)
+        validate_dns_response(query, response, expected_rcode, expected_ip)
+
+    semaphore = asyncio.Semaphore(concurrency)
+    pace_lock = asyncio.Lock()
+    next_start = time.perf_counter()
+
+    async def one(index: int, spec: tuple[str, int, str | None]) -> dict:
+        nonlocal next_start
+        query_name, expected_rcode, expected_ip = spec
+        async with semaphore:
+            if rate:
+                async with pace_lock:
+                    delay = max(0.0, next_start - time.perf_counter())
+                    next_start = max(next_start, time.perf_counter()) + 1.0 / rate
+                if delay:
+                    await asyncio.sleep(delay)
+            query = make_query(query_name)
+            started = time.perf_counter_ns()
+            try:
+                response = await query_fn(query)
+                latency = time.perf_counter_ns() - started
+                validate_dns_response(query, response, expected_rcode, expected_ip)
+                return {
+                    "index": index,
+                    "name": query_name,
+                    "request_id": query.id,
+                    "response_id": response.id,
+                    "rcode": dns.rcode.to_text(response.rcode()),
+                    "latency_ns": latency,
+                    "status": "success",
+                }
+            except Exception as error:
+                if isinstance(error, (asyncio.TimeoutError, httpx.TimeoutException)):
+                    status = "timeout"
+                elif isinstance(error, ValueError):
+                    status = "validation_error"
+                else:
+                    status = "transport_error"
+                error_type = type(error).__name__
+                error_message = str(error)
+            return {
+                "index": index,
+                "name": query_name,
+                "latency_ns": time.perf_counter_ns() - started,
+                "status": status,
+                "error_type": error_type,
+                "error": error_message,
+            }
+
+    started = time.perf_counter()
+    samples = await asyncio.gather(*(one(index, spec) for index, spec in enumerate(plan)))
+    elapsed = time.perf_counter() - started
+    return {"samples": samples, "summary": summarize_samples(name, samples, elapsed, report=report)}
+
+
+def deterministic_plans(seed: int, count: int, prefix: str) -> dict[str, list[tuple[str, int, str | None]]]:
+    rng = random.Random(seed)
+    hot = [("example.com", dns.rcode.NOERROR, None)] * count
+    hot_negative = [(f"negative-{prefix}.invalid", dns.rcode.NXDOMAIN, None)] * count
+    unique = [(f"miss-{prefix}-{index}-{rng.getrandbits(32):08x}.invalid", dns.rcode.NXDOMAIN, None) for index in range(count)]
+    mixed = []
+    for index in range(count):
+        choice = index % 4
+        if choice == 0:
+            mixed.append(("static.perf.home", dns.rcode.NOERROR, "192.0.2.10"))
+        elif choice == 1:
+            mixed.append(("example.com", dns.rcode.NOERROR, None))
+        elif choice == 2:
+            mixed.append((f"negative-{prefix}.invalid", dns.rcode.NXDOMAIN, None))
+        else:
+            mixed.append(unique[index])
+    rng.shuffle(mixed)
+    identical_name = f"identical-{prefix}.invalid"
+    return {
+        "static": [("static.perf.home", dns.rcode.NOERROR, "192.0.2.10")] * count,
+        "blocked": [("blocked.perf.invalid", dns.rcode.NXDOMAIN, None)] * count,
+        "hot-positive": hot,
+        "hot-negative": hot_negative,
+        "cacheable-negative-miss": unique,
+        "mixed": mixed,
+        "concurrent-identical-miss": [(identical_name, dns.rcode.NXDOMAIN, None)] * count,
+    }
+
+
+class PersistentDohClient:
+    def __init__(self, url: str, *, verify: str | bool, timeout: float, concurrency: int):
+        self.url = url
+        self.timeout = timeout
+        self.client = httpx.AsyncClient(
+            verify=verify,
+            http2=False,
+            limits=httpx.Limits(max_connections=concurrency, max_keepalive_connections=concurrency),
+        )
+        self.http_versions: set[str] = set()
+        self.connection_ms: float | None = None
+
+    async def __aenter__(self) -> "PersistentDohClient":
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        await self.client.aclose()
+
+    async def query(self, query: dns.message.Message) -> dns.message.Message:
+        started = time.perf_counter_ns()
+        response = await self.client.post(
+            self.url,
+            content=query.to_wire(),
+            headers={"content-type": "application/dns-message", "accept": "application/dns-message"},
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        if self.connection_ms is None:
+            self.connection_ms = (time.perf_counter_ns() - started) / 1_000_000
+        content_type = response.headers.get("content-type", "").split(";", 1)[0]
+        if content_type != "application/dns-message":
+            raise ValueError(f"unexpected DoH content type {content_type!r}")
+        self.http_versions.add(response.http_version)
+        return dns.message.from_wire(response.content)
+
+
+def upstream_configuration(mode: str) -> tuple[list[str], str]:
+    if mode == "doh":
+        return [REAL_UPSTREAM_DOH], "sequential"
+    if mode == "dot":
+        return [REAL_UPSTREAM_DOT], "sequential"
+    if mode == "hedged":
+        return [REAL_UPSTREAM_DOH, REAL_UPSTREAM_DOT], "hedged"
+    return [REAL_UPSTREAM_DOH, REAL_UPSTREAM_DOT], "sequential"
+
+
+async def run_local_slot(binary: Path, label: str, logical_round: int, slot: int, upstream_mode: str) -> dict:
+    dot_port, doh_port = free_port(), free_port()
+    upstreams, strategy = upstream_configuration(upstream_mode)
+    config = render_config(
+        dot_port=dot_port,
+        doh_port=doh_port,
+        upstream_urls=upstreams,
+        strategy=strategy,
+        blocklist_domains=["blocked.perf.invalid"],
+        static_hosts={"static.perf.home": "192.0.2.10"},
+        cache_max_bytes=64 * 1024,
+    )
+    prefix = f"r{logical_round}-{PERF_OPTIONS.seed}"
+    results = []
+    server_name = f"perf-{label}-{upstream_mode}-r{logical_round}-s{slot}"
+    with DnsRsServer(server_name, config, rust_log="warn", binary=binary, ports=(dot_port, doh_port)) as server:
+        ctx = ssl.create_default_context(cafile=str(CERT_PATH))
+        async with PersistentDotClient("127.0.0.1", dot_port, "localhost", ctx, PERF_OPTIONS.timeout) as dot_client, PersistentDohClient(
+            f"https://localhost:{doh_port}/dns-query",
+            verify=str(CERT_PATH),
+            timeout=PERF_OPTIONS.timeout,
+            concurrency=PERF_OPTIONS.concurrency,
+        ) as doh_client:
+            await dot_client.query(make_query("example.com"))
+            doh_setup_started = time.perf_counter_ns()
+            await doh_client.query(make_query("example.com"))
+            doh_connection_ms = (time.perf_counter_ns() - doh_setup_started) / 1_000_000
+            before = server.resource_snapshot()
+            for transport, query_fn in (("dot", dot_client.query), ("doh", doh_client.query)):
+                transport_prefix = f"{prefix}-{transport}"
+                plans = deterministic_plans(PERF_OPTIONS.seed + logical_round, PERF_OPTIONS.requests, transport_prefix)
+                await query_fn(make_query(f"negative-{transport_prefix}.invalid"))
+                for workload, plan in plans.items():
+                    concurrency = PERF_OPTIONS.concurrency if workload == "concurrent-identical-miss" else 1
+                    warmup = PERF_OPTIONS.warmup if workload in {"static", "blocked", "hot-positive", "hot-negative"} else 0
+                    if warmup:
+                        await measure_queries(
+                            f"{label}/{upstream_mode}/{transport}/{workload}/warmup",
+                            query_fn,
+                            [plan[index % len(plan)] for index in range(warmup)],
+                            concurrency=concurrency,
+                            report=False,
+                        )
+                    workload_before = server.resource_snapshot()
+                    measured = await measure_queries(
+                        f"{label}/{upstream_mode}/{transport}/{workload}",
+                        query_fn,
+                        plan,
+                        concurrency=concurrency,
+                    )
+                    workload_after = server.resource_snapshot()
+                    measured["resources"] = resource_delta(
+                        workload_before,
+                        workload_after,
+                        measured["summary"]["successes"],
+                    )
+                    results.append({"transport": transport, "workload": workload, **measured})
+            after = server.resource_snapshot()
+            successes = sum(result["summary"]["successes"] for result in results)
+            resources = resource_delta(before, after, successes)
+            http_versions = sorted(doh_client.http_versions)
+            connection_setup_ms = {"dot": dot_client.connection_ms, "doh": doh_connection_ms}
+        alive = server.is_alive()
+    return {
+        "label": label,
+        "logical_round": logical_round,
+        "slot": slot,
+        "upstream_mode": upstream_mode,
+        "results": results,
+        "resources": resources,
+        "http_versions": http_versions,
+        "connection_setup_ms": connection_setup_ms,
+        "server_alive_after_measurement": alive,
+        "server_returncode": server.returncode,
+        "server_forced_kill": server.forced_kill,
+    }
+
+
+def paired_summaries(runs: list[dict], label_a: str, label_b: str) -> list[dict]:
+    grouped: dict[tuple[int, str, str, str], dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    p99s: dict[tuple[int, str, str, str], dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    cpu: dict[tuple[int, str, str, str], dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    for run in runs:
+        for result in run["results"]:
+            key = (run["logical_round"], run["upstream_mode"], result["transport"], result["workload"])
+            grouped[key][run["label"]].append(result["summary"]["qps"])
+            p99 = result["summary"]["percentiles_ms"]["p99"]
+            if p99 is not None:
+                p99s[key][run["label"]].append(p99)
+            cpu_per_success = (result.get("resources") or {}).get("cpu_us_per_success")
+            if cpu_per_success is not None:
+                cpu[key][run["label"]].append(cpu_per_success)
+    output = []
+    for key, labels in sorted(grouped.items()):
+        if label_a not in labels or label_b not in labels:
+            continue
+        a = sum(labels[label_a]) / len(labels[label_a])
+        b = sum(labels[label_b]) / len(labels[label_b])
+        a_p99_values = p99s[key].get(label_a, [])
+        b_p99_values = p99s[key].get(label_b, [])
+        a_p99 = sum(a_p99_values) / len(a_p99_values) if a_p99_values else None
+        b_p99 = sum(b_p99_values) / len(b_p99_values) if b_p99_values else None
+        a_cpu_values = cpu[key].get(label_a, [])
+        b_cpu_values = cpu[key].get(label_b, [])
+        a_cpu = sum(a_cpu_values) / len(a_cpu_values) if a_cpu_values else None
+        b_cpu = sum(b_cpu_values) / len(b_cpu_values) if b_cpu_values else None
+        output.append({
+            "logical_round": key[0],
+            "upstream_mode": key[1],
+            "transport": key[2],
+            "workload": key[3],
+            "baseline_qps": a,
+            "candidate_qps": b,
+            "qps_delta_percent": (b - a) / a * 100 if a else None,
+            "baseline_p99_ms": a_p99,
+            "candidate_p99_ms": b_p99,
+            "p99_delta_percent": (b_p99 - a_p99) / a_p99 * 100 if a_p99 and b_p99 is not None else None,
+            "baseline_cpu_us_per_success": a_cpu,
+            "candidate_cpu_us_per_success": b_cpu,
+            "cpu_delta_percent": (b_cpu - a_cpu) / a_cpu * 100 if a_cpu and b_cpu is not None else None,
+        })
+    return output
+
+
+def mean_present(values: list[float | None]) -> float | None:
+    present = [value for value in values if value is not None]
+    return sum(present) / len(present) if present else None
+
+
+def paired_live_summaries(runs: list[dict]) -> list[dict]:
+    grouped: dict[tuple[int, str], dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
+    for run in runs:
+        grouped[(run["logical_round"], run["transport"])][run["label"]].append(run["summary"])
+    output = []
+    for (logical_round, transport), labels in sorted(grouped.items()):
+        if "fly" not in labels or "cloudflare" not in labels:
+            continue
+        fly_qps = mean_present([item["qps"] for item in labels["fly"]])
+        cloudflare_qps = mean_present([item["qps"] for item in labels["cloudflare"]])
+        fly_p99 = mean_present([item["percentiles_ms"]["p99"] for item in labels["fly"]])
+        cloudflare_p99 = mean_present([item["percentiles_ms"]["p99"] for item in labels["cloudflare"]])
+        output.append({
+            "logical_round": logical_round,
+            "transport": transport,
+            "fly_qps": fly_qps,
+            "cloudflare_qps": cloudflare_qps,
+            "fly_vs_cloudflare_qps_delta_percent": (fly_qps - cloudflare_qps) / cloudflare_qps * 100 if fly_qps is not None and cloudflare_qps else None,
+            "fly_p99_ms": fly_p99,
+            "cloudflare_p99_ms": cloudflare_p99,
+            "fly_vs_cloudflare_p99_delta_percent": (fly_p99 - cloudflare_p99) / cloudflare_p99 * 100 if fly_p99 is not None and cloudflare_p99 else None,
+        })
+    return output
+
+
+def evidence_document(mode: str, runs: list[dict], binaries: list[dict], extra: dict | None = None) -> dict:
+    git_status = command_text("git", "-C", str(REPO_ROOT), "status", "--short")
+    metadata = {
+        "schema_version": 1,
+        "mode": mode,
+        "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "invocation": sys.argv,
+        "hostname": platform.node(),
+        "platform": platform.platform(),
+        "kernel": platform.release(),
+        "architecture": platform.machine(),
+        "python": platform.python_version(),
+        "logical_cpus": os.cpu_count(),
+        "cpu_model": next((line.partition(":")[2].strip() for line in Path("/proc/cpuinfo").read_text().splitlines() if line.startswith("model name")), None) if Path("/proc/cpuinfo").exists() else None,
+        "git_commit": command_text("git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"),
+        "git_dirty": bool(git_status),
+        "git_status": git_status,
+        "rustc": command_text("rustc", "--version", "--verbose"),
+        "cargo": command_text("cargo", "--version"),
+        "perf_available": shutil.which("perf") is not None,
+        "rust_log": "warn" if mode == "perf-local" else None,
+        "connection_policy": {
+            "dot": "one persistent multiplexed TLS connection per target and slot; handshake measured separately",
+            "doh": "one persistent httpx.AsyncClient per target and slot; HTTP/1.1; matching connection limits",
+        },
+        "build": {
+            "profile": "release",
+            "locked": True,
+            "features": "default (dot,doh)",
+            "lto": True,
+            "codegen_units": 1,
+            "strip": True,
+            "rustflags": os.environ.get("RUSTFLAGS", ""),
+        },
+        "settings": {
+            "seed": PERF_OPTIONS.seed,
+            "rounds": PERF_OPTIONS.rounds,
+            "requests": PERF_OPTIONS.requests,
+            "warmup": PERF_OPTIONS.warmup,
+            "concurrency": PERF_OPTIONS.concurrency,
+            "timeout_s": PERF_OPTIONS.timeout,
+            "live_rate_qps_aggregate": PERF_OPTIONS.live_rate,
+        },
+        "limitations": [
+            "public-network latency includes client routing, Fly placement, TLS, and upstream RTT",
+            "Linux /proc CPU is process-wide and does not attribute cost to functions",
+            "perf profiling is unavailable when perf_available is false",
+        ],
+    }
+    if extra:
+        metadata.update(extra)
+    return {"metadata": metadata, "binaries": binaries, "runs": runs}
+
+
+def write_evidence(mode: str, evidence: dict) -> Path:
+    path = PERF_OPTIONS.output or RUN_DIR / f"{mode}-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(evidence, indent=2) + "\n")
+    print(f"  evidence: {path}")
+    return path
+
+
+async def run_sweep_probe(binary: Path, label: str) -> dict:
+    dot_port, doh_port = free_port(), free_port()
+    config = render_config(
+        dot_port=dot_port,
+        doh_port=doh_port,
+        upstream_urls=[REAL_UPSTREAM_DOH],
+        static_hosts={"static.perf.home": "192.0.2.10"},
+        cache_max_bytes=4096,
+    )
+    samples = []
+    with DnsRsServer(f"perf-{label}-sweep", config, rust_log="warn", binary=binary, ports=(dot_port, doh_port)) as server:
+        ctx = ssl.create_default_context(cafile=str(CERT_PATH))
+        async with PersistentDotClient("127.0.0.1", dot_port, "localhost", ctx, PERF_OPTIONS.timeout) as dot_client:
+            before = server.resource_snapshot()
+            deadline = time.monotonic() + PERF_OPTIONS.sweep_seconds
+            index = 0
+            while time.monotonic() < deadline:
+                plan = [
+                    ("static.perf.home", dns.rcode.NOERROR, "192.0.2.10")
+                    if index % 4 == 0
+                    else (f"sweep-{PERF_OPTIONS.seed}-{index}.invalid", dns.rcode.NXDOMAIN, None)
+                ]
+                measured = await measure_queries(f"{label}/sweep-over-30s", dot_client.query, plan, report=False)
+                samples.extend(measured["samples"])
+                index += 1
+                await asyncio.sleep(0.9)
+            elapsed = PERF_OPTIONS.sweep_seconds
+            after = server.resource_snapshot()
+            summary = summarize_samples(f"{label}/sweep-over-30s", samples, elapsed)
+            resources = resource_delta(before, after, summary["successes"])
+            alive = server.is_alive()
+    return {
+        "label": label,
+        "workload": "sweep-over-30s",
+        "duration_s": PERF_OPTIONS.sweep_seconds,
+        "samples": samples,
+        "summary": summary,
+        "resources": resources,
+        "server_alive_after_measurement": alive,
+        "server_returncode": server.returncode,
+        "server_forced_kill": server.forced_kill,
+    }
+
+
+async def scenario_perf_local() -> bool:
+    section("perf-local: reproducible A-B-B-A")
+    labels = [(PERF_OPTIONS.label_a, PERF_OPTIONS.binary_a)]
+    if PERF_OPTIONS.binary_b:
+        labels.append((PERF_OPTIONS.label_b, PERF_OPTIONS.binary_b))
+    modes = ["doh", "dot", "sequential", "hedged"]
+    runs = []
+    for logical_round in range(PERF_OPTIONS.rounds):
+        if len(labels) == 1:
+            order = labels
+        elif logical_round % 2 == 0:
+            order = [labels[0], labels[1], labels[1], labels[0]]
+        else:
+            order = [labels[1], labels[0], labels[0], labels[1]]
+        for slot, (label, binary) in enumerate(order):
+            for upstream_mode in modes:
+                runs.append(await run_local_slot(binary, label, logical_round, slot, upstream_mode))
+
+    binaries = [binary_metadata(label, binary) for label, binary in labels]
+    sweep_runs = [await run_sweep_probe(binary, label) for label, binary in labels]
+    evidence = evidence_document("perf-local", runs, binaries)
+    evidence["sweep_runs"] = sweep_runs
+    if len(labels) == 2:
+        evidence["paired_summaries"] = paired_summaries(runs, labels[0][0], labels[1][0])
+    write_evidence("perf-local", evidence)
+    errors = sum(result["summary"]["error_count"] for run in runs for result in run["results"])
+    errors += sum(run["summary"]["error_count"] for run in sweep_runs)
+    alive = all(run["server_alive_after_measurement"] for run in runs) and all(run["server_alive_after_measurement"] for run in sweep_runs)
+    return check("local performance runs completed with valid responses", errors == 0 and alive, detail=f"errors={errors}")
+
+
+async def scenario_perf_live() -> bool:
+    section("perf-live: paired Fly vs Cloudflare DoT and DoH")
+    fly_doh_url = PERF_OPTIONS.fly_doh_url or f"https://{PERF_OPTIONS.fly_host}/dns-query"
+    targets = {
+        "fly": {
+            "dot": (PERF_OPTIONS.fly_host, 853, PERF_OPTIONS.fly_host),
+            "doh": fly_doh_url,
+        },
+        "cloudflare": {
+            "dot": (PERF_OPTIONS.cloudflare_dot_host, 853, "cloudflare-dns.com"),
+            "doh": PERF_OPTIONS.cloudflare_doh_url,
+        },
+    }
+    runs = []
+    interval = 1.0 / PERF_OPTIONS.live_rate
+    next_start = time.perf_counter()
+    for logical_round in range(PERF_OPTIONS.rounds):
+        order = ["fly", "cloudflare", "cloudflare", "fly"] if logical_round % 2 == 0 else ["cloudflare", "fly", "fly", "cloudflare"]
+        clients = []
+        try:
+            for transport in ("dot", "doh"):
+                for slot, label in enumerate(order):
+                    target = targets[label]
+                    if transport == "dot":
+                        client = PersistentDotClient(*target["dot"], ssl.create_default_context(), PERF_OPTIONS.timeout)
+                    else:
+                        client = PersistentDohClient(target["doh"], verify=True, timeout=PERF_OPTIONS.timeout, concurrency=1)
+                    await client.__aenter__()
+                    clients.append(client)
+                    samples = []
+                    started = time.perf_counter()
+                    for index in range(PERF_OPTIONS.requests):
+                        delay = max(0.0, next_start - time.perf_counter())
+                        if delay:
+                            await asyncio.sleep(delay)
+                        next_start = max(next_start, time.perf_counter()) + interval
+                        name = WARM_DOMAINS[(logical_round + index) % len(WARM_DOMAINS)]
+                        measured = await measure_queries(
+                            f"live/{transport}/{label}/r{logical_round}/s{slot}",
+                            client.query,
+                            [(name, dns.rcode.NOERROR, None)],
+                            report=False,
+                        )
+                        samples.extend(measured["samples"])
+                    elapsed = time.perf_counter() - started
+                    runs.append({
+                        "label": label,
+                        "logical_round": logical_round,
+                        "slot": slot,
+                        "transport": transport,
+                        "connection_setup_ms": client.connection_ms,
+                        "http_versions": sorted(client.http_versions) if transport == "doh" else [],
+                        "samples": samples,
+                        "summary": summarize_samples(f"live/{transport}/{label}/r{logical_round}/s{slot}", samples, elapsed),
+                    })
+        finally:
+            for client in reversed(clients):
+                await client.__aexit__(None, None, None)
+
+    evidence = evidence_document("perf-live", runs, [], {"targets": targets})
+    evidence["paired_summaries"] = paired_live_summaries(runs)
+    write_evidence("perf-live", evidence)
+    errors = sum(run["summary"]["error_count"] for run in runs)
+    return check("live performance runs completed with valid responses", errors == 0, detail=f"errors={errors}")
+
+
+# --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 
@@ -980,17 +1758,30 @@ SCENARIOS = {
     "durability": scenario_durability,
     "memory": scenario_memory_churn,
     "dot-limits": scenario_dot_connection_limits,
+    "perf-local": scenario_perf_local,
+    "perf-live": scenario_perf_live,
 }
+
+MEASUREMENT_SCENARIOS = {"perf-local", "perf-live"}
 
 
 async def run(selected: list[str]) -> int:
-    if not BINARY.exists():
-        print(f"error: {BINARY} not found - run `cargo build --release` first", file=sys.stderr)
+    local_binaries = [PERF_OPTIONS.binary_a]
+    if PERF_OPTIONS.binary_b:
+        local_binaries.append(PERF_OPTIONS.binary_b)
+    needs_local_server = any(name != "perf-live" for name in selected)
+    missing = [binary for binary in local_binaries if needs_local_server and not binary.is_file()]
+    if missing:
+        print(f"error: missing binary: {missing[0]}", file=sys.stderr)
         return 2
-    if shutil.which("openssl") is None:
+    if needs_local_server and shutil.which("openssl") is None:
         print("error: openssl not found on PATH (needed to generate the test cert)", file=sys.stderr)
         return 2
-    ensure_certs()
+    if PERF_OPTIONS.output and len(selected) > 1:
+        print("error: --output requires exactly one selected scenario", file=sys.stderr)
+        return 2
+    if needs_local_server:
+        ensure_certs()
     RUN_DIR.mkdir(parents=True, exist_ok=True)
 
     overall_ok = True
@@ -1014,11 +1805,67 @@ async def run(selected: list[str]) -> int:
     return 0 if overall_ok else 1
 
 
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("scenarios", nargs="*", default=["all"], choices=[*SCENARIOS, "all"], help="which scenarios to run")
+    parser.add_argument("--binary-a", type=Path, default=BINARY, help="baseline or single local binary")
+    parser.add_argument("--binary-b", type=Path, help="candidate local binary for paired runs")
+    parser.add_argument("--label-a", default="baseline")
+    parser.add_argument("--label-b", default="candidate")
+    parser.add_argument("--output", type=Path, help="JSON evidence path")
+    parser.add_argument("--seed", type=int, default=PERF_SEED)
+    parser.add_argument("--rounds", type=positive_int, default=8)
+    parser.add_argument("--requests", type=positive_int, default=PERF_REQUESTS)
+    parser.add_argument("--warmup", type=positive_int, default=PERF_WARMUP)
+    parser.add_argument("--concurrency", type=positive_int, default=8)
+    parser.add_argument("--timeout", type=positive_float, default=8.0)
+    parser.add_argument("--live-rate", type=positive_float, default=PERF_LIVE_RATE, help="aggregate public requests per second")
+    parser.add_argument("--fly-host", default=os.environ.get("E2E_PERF_FLY_HOST", "dns-rs-cold-hollow-7445.fly.dev"))
+    parser.add_argument("--fly-doh-url")
+    parser.add_argument("--cloudflare-dot-host", default=os.environ.get("E2E_PERF_CLOUDFLARE_IP", "1.1.1.1"))
+    parser.add_argument("--cloudflare-doh-url", default=REAL_UPSTREAM_DOH)
+    parser.add_argument("--sweep-seconds", type=positive_float, default=31.0)
     args = parser.parse_args()
-    selected = list(SCENARIOS) if "all" in args.scenarios else args.scenarios
+    if args.binary_b and args.label_a == args.label_b:
+        parser.error("--label-a and --label-b must differ")
+    if "perf-live" in args.scenarios and args.live_rate > 1.0:
+        parser.error("--live-rate must be <= 1 request/second aggregate")
+
+    global PERF_OPTIONS
+    PERF_OPTIONS = PerfOptions(
+        binary_a=args.binary_a.expanduser().resolve(),
+        binary_b=args.binary_b.expanduser().resolve() if args.binary_b else None,
+        label_a=args.label_a,
+        label_b=args.label_b,
+        output=args.output.expanduser().resolve() if args.output else None,
+        seed=args.seed,
+        rounds=args.rounds,
+        requests=args.requests,
+        warmup=args.warmup,
+        concurrency=args.concurrency,
+        timeout=args.timeout,
+        live_rate=args.live_rate,
+        fly_host=args.fly_host,
+        fly_doh_url=args.fly_doh_url or "",
+        cloudflare_dot_host=args.cloudflare_dot_host,
+        cloudflare_doh_url=args.cloudflare_doh_url,
+        sweep_seconds=args.sweep_seconds,
+    )
+    selected = [name for name in SCENARIOS if name not in MEASUREMENT_SCENARIOS] if "all" in args.scenarios else args.scenarios
     code = asyncio.run(run(selected))
     sys.exit(code)
 

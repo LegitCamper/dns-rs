@@ -7,7 +7,8 @@ under pressure, and memory behavior under sustained concurrent load.
 
 ## Prerequisites
 
-- `cargo build --release` (the harness runs the release binary)
+- `cargo build --release` (the harness runs the release binary; override with
+  `DNSRS_E2E_BINARY=/path/to/dns-rs`)
 - `openssl` on `PATH` (used once to generate a local self-signed cert under
   `tests/e2e/certs/`, gitignored)
 - `uv` (runs the script with its pinned deps via the PEP 723 header - no venv
@@ -24,7 +25,83 @@ uv run tests/e2e/harness.py cache durability
 ```
 
 Scenarios: `smoke`, `cache`, `cache-saturation`, `durability`, `memory`,
-`dot-limits`.
+`dot-limits`, `perf-local`, `perf-live`. Measurement scenarios are opt-in and
+are not included by `all`.
+
+## Performance measurement
+
+Performance runs are opt-in. They reuse one multiplexed TLS connection per DoT
+target and one persistent HTTP/1.1 `httpx.AsyncClient` per DoH target. TLS setup
+is recorded separately and excluded from steady-state samples. Measured local
+servers use `RUST_LOG=warn`; correctness scenarios keep existing log defaults.
+
+Build baseline and candidate with identical locked inputs. An exact committed
+baseline can be exported without touching dirty source:
+
+```sh
+REV=9e9d56419452b822e226c3e7f6f8329f8fd244b2
+mkdir -p tests/e2e/.run/builds/baseline-src
+git archive "$REV" | tar -x -C tests/e2e/.run/builds/baseline-src
+CARGO_INCREMENTAL=0 cargo build --release --locked \
+  --manifest-path tests/e2e/.run/builds/baseline-src/Cargo.toml \
+  --target-dir tests/e2e/.run/builds/baseline-target
+CARGO_INCREMENTAL=0 cargo build --release --locked \
+  --target-dir tests/e2e/.run/builds/candidate-target
+```
+
+Run one binary or an eight-round paired A-B-B-A comparison:
+
+```sh
+uv run tests/e2e/harness.py perf-local \
+  --binary-a tests/e2e/.run/builds/baseline-target/release/dns-rs \
+  --rounds 1 --requests 50 --warmup 10 --seed 20260413
+
+uv run tests/e2e/harness.py perf-local \
+  --binary-a tests/e2e/.run/builds/baseline-target/release/dns-rs \
+  --binary-b tests/e2e/.run/builds/candidate-target/release/dns-rs \
+  --label-a baseline --label-b candidate \
+  --rounds 8 --requests 200 --warmup 20 --concurrency 8 \
+  --seed 20260413 --output tests/e2e/.run/perf-local.json
+```
+
+Each logical paired round starts fresh processes in A-B-B-A order, reversing
+outer/inner labels on alternating rounds. Warmups, startup, and TLS setup do not
+enter latency samples. Workloads cover static and blocked responses, hot positive
+and negative cache entries, unique negative misses, seeded mixed traffic,
+concurrent identical misses, and a `sweep-over-30s` mixed probe whose default
+31-second window crosses the cache sweep interval. Every response is validated
+for ID, question, rcode, decoding, and expected static answer. Local runs repeat
+against Cloudflare DoH only, Cloudflare DoT only, current sequential list, and
+hedged list.
+
+Public comparison is deliberately bounded to one request/second aggregate across
+DoT and DoH:
+
+```sh
+uv run tests/e2e/harness.py perf-live \
+  --rounds 8 --requests 10 --live-rate 1 \
+  --fly-host dns-rs-cold-hollow-7445.fly.dev \
+  --output tests/e2e/.run/perf-live.json
+```
+
+`--fly-doh-url`, `--cloudflare-dot-host`, and `--cloudflare-doh-url` override
+endpoints. Live mode compares current Fly and direct Cloudflare separately for
+DoT and DoH. It does not require a local binary or mutate Fly state.
+
+JSON evidence contains raw per-request samples, p50/p90/p95/p99/max, QPS,
+errors/timeouts/validation failures, process CPU and RSS when `/proc` exists,
+connection policy, HTTP versions, server exits, seed/workload settings, Git
+state, binary path/size/SHA-256, toolchain, OS/CPU, build profile/features/flags,
+and profiler availability. Default output is under ignored
+`tests/e2e/.run/perf-*.json`.
+
+Retain an optimization only when at least six of eight paired rounds show a
+>=5% affected latency, CPU/query, or QPS improvement, with no response mismatch,
+error increase, added upstream behavior, or >5% p99 regression. Static/hot gaps
+mostly isolate inbound processing and placement overhead; miss gaps include the
+extra upstream RTT. Public-network deltas are not evidence of Rust-only cost.
+When `perf` is unavailable, `/proc` metrics remain process-wide and cannot prove
+function-level lock attribution.
 
 The memory scenario's duration/concurrency can be overridden:
 

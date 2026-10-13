@@ -70,7 +70,16 @@ fn load_config(path: &Path) -> Result<LoadedConfig> {
     Ok(LoadedConfig { config, raw })
 }
 
-#[tokio::main]
+/// Single-threaded on purpose. The deployment target is a 1-vCPU machine
+/// (see fly.toml), where the multi-threaded runtime's work-stealing,
+/// cross-worker wakeups, and atomic bookkeeping are pure overhead with no
+/// parallelism to buy back. It also makes every mutex in the process
+/// uncontended by construction.
+///
+/// ponytail: if this is ever deployed to a multi-core machine, the right
+/// shape is one current-thread runtime per core with SO_REUSEPORT sockets
+/// (shared-nothing), not a switch back to the work-stealing runtime.
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
