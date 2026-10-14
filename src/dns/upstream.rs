@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use futures_util::future::select_ok;
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -15,13 +15,14 @@ use rustc_hash::FxHashMap;
 use rustls_pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, oneshot};
 use tokio::time::timeout;
-use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
 use tracing::{debug, warn};
 
 use crate::config::{UpstreamConfig, UpstreamStrategy};
+use crate::dns::wire::{QuestionKey, set_id};
 
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -51,7 +52,7 @@ const DOT_KEEPALIVE_SCAN_INTERVAL: Duration = Duration::from_secs(5);
 /// by network-free test doubles (see `test_support`).
 pub trait Upstream: Send + Sync {
     fn label(&self) -> &str;
-    fn resolve(&self, query: &Message) -> impl Future<Output = Result<Message>> + Send;
+    fn resolve(&self, query: &[u8]) -> impl Future<Output = Result<Vec<u8>>> + Send;
 }
 
 const MAX_DOT_CONNECTIONS: usize = 2;
@@ -59,7 +60,7 @@ const MAX_DOT_IN_FLIGHT: usize = 256;
 const ADDRESS_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(2);
 const DOT_RESPONSE_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 
-type DotReply = std::result::Result<Message, DotFailure>;
+type DotReply = std::result::Result<Vec<u8>, DotFailure>;
 
 #[derive(Debug, Clone)]
 enum DotFailure {
@@ -77,7 +78,7 @@ impl std::fmt::Display for DotFailure {
 
 struct PendingQuery {
     reply: oneshot::Sender<DotReply>,
-    expected_queries: Vec<Query>,
+    expected_question: QuestionKey,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -92,7 +93,9 @@ impl Drop for PendingQueryGuard {
         let connection = self.connection.clone();
         tokio::spawn(async move {
             tokio::time::sleep(DOT_RESPONSE_BODY_TIMEOUT).await;
-            let Some(connection) = connection.upgrade() else { return };
+            let Some(connection) = connection.upgrade() else {
+                return;
+            };
             let still_abandoned = connection
                 .pending
                 .lock()
@@ -100,7 +103,9 @@ impl Drop for PendingQueryGuard {
                 .get(&id)
                 .is_some_and(|pending| pending.reply.is_closed());
             if still_abandoned {
-                connection.fail(DotFailure::Connection("DoT connection closed after an abandoned query timed out".to_string()));
+                connection.fail(DotFailure::Connection(
+                    "DoT connection closed after an abandoned query timed out".to_string(),
+                ));
             }
         });
     }
@@ -138,15 +143,15 @@ impl DotConnection {
         self.capacity.clone().try_acquire_owned().ok()
     }
 
-    async fn query(self: &Arc<Self>, query: &Message, permit: OwnedSemaphorePermit) -> DotReply {
+    async fn query(self: &Arc<Self>, query: &[u8], permit: OwnedSemaphorePermit) -> DotReply {
         if !self.is_alive() {
             return Err(DotFailure::Connection("DoT connection closed".to_string()));
         }
 
         self.last_used.store(monotonic_millis(), Ordering::Release);
         let (reply_tx, reply_rx) = oneshot::channel();
-        let mut outgoing = query.clone();
-        let mut frame;
+        let mut outgoing = query.to_vec();
+        let frame;
         let id;
         {
             let mut pending = self.pending.lock().unwrap();
@@ -155,20 +160,20 @@ impl DotConnection {
             }
 
             id = next_available_id(&pending, rand::random());
-            outgoing.metadata.id = id;
-            let wire = outgoing
-                .to_vec()
-                .map_err(|err| DotFailure::Protocol(format!("failed to encode upstream query: {err}")))?;
-            let len = u16::try_from(wire.len())
+            set_id(&mut outgoing, id);
+            let len = u16::try_from(outgoing.len())
                 .map_err(|_| DotFailure::Protocol("query too large for DoT framing".to_string()))?;
-            frame = Vec::with_capacity(2 + wire.len());
-            frame.extend_from_slice(&len.to_be_bytes());
-            frame.extend_from_slice(&wire);
+            let expected_question = QuestionKey::from_wire(&outgoing)
+                .ok_or_else(|| DotFailure::Protocol("query has no valid question".to_string()))?;
+            let mut built = Vec::with_capacity(2 + outgoing.len());
+            built.extend_from_slice(&len.to_be_bytes());
+            built.extend_from_slice(&outgoing);
+            frame = built;
             pending.insert(
                 id,
                 PendingQuery {
                     reply: reply_tx,
-                    expected_queries: std::mem::take(&mut outgoing.queries),
+                    expected_question,
                     _permit: permit,
                 },
             );
@@ -229,19 +234,26 @@ async fn dot_writer(
         .await;
         if let Err(err) = result {
             if let Some(connection) = connection.upgrade() {
-                connection.fail(DotFailure::Connection(format!("failed to write DoT query: {err}")));
+                connection.fail(DotFailure::Connection(format!(
+                    "failed to write DoT query: {err}"
+                )));
             }
             return;
         }
     }
 }
 
-async fn dot_reader(connection: std::sync::Weak<DotConnection>, mut reader: ReadHalf<TlsStream<TcpStream>>) {
+async fn dot_reader(
+    connection: std::sync::Weak<DotConnection>,
+    mut reader: ReadHalf<TlsStream<TcpStream>>,
+) {
     loop {
         let mut len = [0u8; 2];
         if let Err(err) = reader.read_exact(&mut len).await {
             if let Some(connection) = connection.upgrade() {
-                connection.fail(DotFailure::Connection(format!("failed to read DoT response length: {err}")));
+                connection.fail(DotFailure::Connection(format!(
+                    "failed to read DoT response length: {err}"
+                )));
             }
             return;
         }
@@ -256,36 +268,42 @@ async fn dot_reader(connection: std::sync::Weak<DotConnection>, mut reader: Read
             Ok(Ok(_)) => {}
             Ok(Err(err)) => {
                 if let Some(connection) = connection.upgrade() {
-                    connection.fail(DotFailure::Connection(format!("failed to read DoT response: {err}")));
+                    connection.fail(DotFailure::Connection(format!(
+                        "failed to read DoT response: {err}"
+                    )));
                 }
                 return;
             }
             Err(_) => {
                 if let Some(connection) = connection.upgrade() {
-                    connection.fail(DotFailure::Connection("timed out reading DoT response".to_string()));
+                    connection.fail(DotFailure::Connection(
+                        "timed out reading DoT response".to_string(),
+                    ));
                 }
                 return;
             }
         }
-        let response = match Message::from_vec(&wire) {
-            Ok(response) => response,
-            Err(err) => {
-                if let Some(connection) = connection.upgrade() {
-                    connection.fail(DotFailure::Protocol(format!("invalid DoT response: {err}")));
-                }
-                return;
+        let Some(response_id) = wire.get(0..2).map(|id| u16::from_be_bytes([id[0], id[1]])) else {
+            if let Some(connection) = connection.upgrade() {
+                connection.fail(DotFailure::Protocol("short DoT response".to_string()));
             }
+            return;
         };
-        let Some(connection) = connection.upgrade() else { return };
-        let pending = connection.pending.lock().unwrap().remove(&response.metadata.id);
+        let Some(connection) = connection.upgrade() else {
+            return;
+        };
+        let pending = connection.pending.lock().unwrap().remove(&response_id);
         match pending {
-            Some(pending) if response.queries == pending.expected_queries => {
-                let _ = pending.reply.send(Ok(response));
+            Some(pending)
+                if wire.get(2).is_some_and(|flags| flags & 0x80 != 0)
+                    && pending.expected_question.matches(&wire) =>
+            {
+                let _ = pending.reply.send(Ok(wire));
             }
             Some(pending) => {
                 let error = DotFailure::Protocol(format!(
                     "DoT response question mismatch for ID {}",
-                    response.metadata.id
+                    response_id
                 ));
                 let _ = pending.reply.send(Err(error));
                 connection.fail(DotFailure::Connection(
@@ -296,7 +314,7 @@ async fn dot_reader(connection: std::sync::Weak<DotConnection>, mut reader: Read
             None => {
                 connection.fail(DotFailure::Protocol(format!(
                     "unexpected DoT response ID {}",
-                    response.metadata.id
+                    response_id
                 )));
                 return;
             }
@@ -315,7 +333,13 @@ struct DotPool {
 }
 
 impl DotPool {
-    fn new(host: String, port: u16, addresses: Box<[SocketAddr]>, server_name: ServerName<'static>, connector: TlsConnector) -> Self {
+    fn new(
+        host: String,
+        port: u16,
+        addresses: Box<[SocketAddr]>,
+        server_name: ServerName<'static>,
+        connector: TlsConnector,
+    ) -> Self {
         Self {
             host,
             port,
@@ -332,10 +356,11 @@ impl DotPool {
             {
                 let mut connections = self.connections.lock().await;
                 connections.retain(|connection| connection.is_alive());
-                if let Some(pair) = connections
-                    .iter()
-                    .find_map(|connection| connection.try_reserve().map(|permit| (Arc::clone(connection), permit)))
-                {
+                if let Some(pair) = connections.iter().find_map(|connection| {
+                    connection
+                        .try_reserve()
+                        .map(|permit| (Arc::clone(connection), permit))
+                }) {
                     return Ok(pair);
                 }
                 if connections.len() >= MAX_DOT_CONNECTIONS {
@@ -350,7 +375,8 @@ impl DotPool {
                         })
                         .collect();
                     drop(connections);
-                    let ((connection, permit), _, _) = futures_util::future::select_all(waits).await;
+                    let ((connection, permit), _, _) =
+                        futures_util::future::select_all(waits).await;
                     let permit = permit.map_err(|_| anyhow!("DoT connection closed"))?;
                     if connection.is_alive() {
                         return Ok((connection, permit));
@@ -362,10 +388,11 @@ impl DotPool {
             let _dialing = self.dialing.lock().await;
             let mut connections = self.connections.lock().await;
             connections.retain(|connection| connection.is_alive());
-            if let Some(pair) = connections
-                .iter()
-                .find_map(|connection| connection.try_reserve().map(|permit| (Arc::clone(connection), permit)))
-            {
+            if let Some(pair) = connections.iter().find_map(|connection| {
+                connection
+                    .try_reserve()
+                    .map(|permit| (Arc::clone(connection), permit))
+            }) {
                 return Ok(pair);
             }
             if connections.len() < MAX_DOT_CONNECTIONS {
@@ -405,7 +432,7 @@ impl DotPool {
             .context("TLS handshake with upstream failed")
     }
 
-    async fn query(self: &Arc<Self>, query: &Message) -> Result<Message> {
+    async fn query_wire(self: &Arc<Self>, query: &[u8]) -> Result<Vec<u8>> {
         let mut retried = false;
         loop {
             let (connection, permit) = self.connection().await?;
@@ -420,6 +447,12 @@ impl DotPool {
         }
     }
 
+    #[cfg(test)]
+    async fn query(self: &Arc<Self>, query: &Message) -> Result<Message> {
+        let response = self.query_wire(&query.to_vec()?).await?;
+        Message::from_vec(&response).context("failed to decode test DoT response")
+    }
+
     async fn keepalive(self: &Arc<Self>) {
         let connections = {
             let mut connections = self.connections.lock().await;
@@ -428,6 +461,9 @@ impl DotPool {
         };
         let mut probe = Message::query();
         probe.add_query(Query::query(Name::root(), RecordType::NS));
+        let probe = probe
+            .to_vec()
+            .expect("fixed root-NS keepalive query must encode");
         let probes = connections.into_iter().filter_map(|connection| {
             if !connection.was_idle_for(DOT_KEEPALIVE_INTERVAL) {
                 return None;
@@ -438,7 +474,9 @@ impl DotPool {
                 match timeout(H2_KEEPALIVE_TIMEOUT, connection.query(&probe, permit)).await {
                     Ok(Ok(_)) => {}
                     Ok(Err(err)) => connection.fail(err),
-                    Err(_) => connection.fail(DotFailure::Connection("DoT keepalive timed out".to_string())),
+                    Err(_) => connection.fail(DotFailure::Connection(
+                        "DoT keepalive timed out".to_string(),
+                    )),
                 }
             })
         });
@@ -474,18 +512,27 @@ impl Upstream for SingleUpstream {
         &self.label
     }
 
-    async fn resolve(&self, query: &Message) -> Result<Message> {
+    async fn resolve(&self, query: &[u8]) -> Result<Vec<u8>> {
         match &self.backend {
-            Backend::Dot(pool) => pool.query(query).await,
+            Backend::Dot(pool) => pool.query_wire(query).await,
             Backend::Doh { url, http } => {
-                let mut outgoing = query.clone();
-                outgoing.metadata.id = rand::random();
-                let expected_id = outgoing.metadata.id;
-                let wire = outgoing.to_vec().context("failed to encode upstream query")?;
-                let response_bytes = query_doh(http, url, Bytes::from(wire)).await?;
-                let response = Message::from_vec(&response_bytes).context("failed to decode upstream response")?;
-                if response.metadata.id != expected_id {
+                let mut outgoing = query.to_vec();
+                let expected_id = rand::random();
+                set_id(&mut outgoing, expected_id);
+                let expected_question = QuestionKey::from_wire(&outgoing)
+                    .ok_or_else(|| anyhow!("query has no valid question"))?;
+                let response = query_doh(http, url, Bytes::from(outgoing)).await?;
+                let response_id = response
+                    .get(0..2)
+                    .map(|id| u16::from_be_bytes([id[0], id[1]]));
+                if response_id != Some(expected_id) {
                     bail!("upstream response ID mismatch");
+                }
+                if !response.get(2).is_some_and(|flags| flags & 0x80 != 0) {
+                    bail!("upstream returned a query instead of a response");
+                }
+                if !expected_question.matches(&response) {
+                    bail!("upstream response question mismatch");
                 }
                 Ok(response)
             }
@@ -498,7 +545,7 @@ impl<T: Upstream + ?Sized> Upstream for Arc<T> {
         (**self).label()
     }
 
-    async fn resolve(&self, query: &Message) -> Result<Message> {
+    async fn resolve(&self, query: &[u8]) -> Result<Vec<u8>> {
         (**self).resolve(query).await
     }
 }
@@ -544,7 +591,7 @@ impl SingleUpstream {
     async fn warm(&self) -> Result<()> {
         let mut probe = Message::query();
         probe.add_query(Query::query(Name::root(), RecordType::NS));
-        self.resolve(&probe).await.map(|_| ())
+        self.resolve(&probe.to_vec()?).await.map(|_| ())
     }
 }
 
@@ -570,11 +617,15 @@ impl MultiUpstream<SingleUpstream> {
     }
 }
 
-async fn hedged_attempt<U: Upstream>(upstream: &U, query: &Message) -> Result<Message> {
+async fn hedged_attempt<U: Upstream>(upstream: &U, query: &[u8]) -> Result<Vec<u8>> {
     match upstream.resolve(query).await {
         Ok(response) => Ok(response),
         Err(err) => {
-            warn!(upstream = upstream.label(), error = format!("{err:#}"), "upstream query failed (hedged)");
+            warn!(
+                upstream = upstream.label(),
+                error = format!("{err:#}"),
+                "upstream query failed (hedged)"
+            );
             Err(err)
         }
     }
@@ -582,20 +633,33 @@ async fn hedged_attempt<U: Upstream>(upstream: &U, query: &Message) -> Result<Me
 
 impl<U: Upstream> MultiUpstream<U> {
     pub fn new(upstreams: Vec<U>, strategy: Strategy) -> Self {
-        Self { upstreams, strategy }
+        Self {
+            upstreams,
+            strategy,
+        }
     }
 
     /// Each attempt randomizes its own outgoing query ID; the caller's
     /// original ID is restored on the returned message.
-    pub async fn resolve(&self, query: &Message) -> Result<Message> {
-        let original_id = query.metadata.id;
+    pub async fn resolve_wire(&self, query: &[u8]) -> Result<Vec<u8>> {
+        let original_id = query
+            .get(0..2)
+            .map_or(0, |id| u16::from_be_bytes([id[0], id[1]]));
         let mut response = match self.strategy {
             Strategy::Sequential => self.resolve_sequential(query).await,
             Strategy::Hedged => self.resolve_hedged(query).await,
             Strategy::Race => self.resolve_race(query).await,
         }?;
-        response.metadata.id = original_id;
+        set_id(&mut response, original_id);
         Ok(response)
+    }
+
+    /// Test convenience: production stays byte-native, while the behavior
+    /// tests can keep expressing assertions in hickory's structured form.
+    #[cfg(test)]
+    pub async fn resolve(&self, query: &Message) -> Result<Message> {
+        let response = self.resolve_wire(&query.to_vec()?).await?;
+        Message::from_vec(&response).context("failed to decode test upstream response")
     }
 
     /// Falling back across N upstreams must not cost N times
@@ -605,14 +669,17 @@ impl<U: Upstream> MultiUpstream<U> {
     /// from under us mid-response. Bound the whole sequential attempt by a
     /// single deadline instead, splitting it across however many upstreams
     /// there are to try.
-    async fn resolve_sequential(&self, query: &Message) -> Result<Message> {
+    async fn resolve_sequential(&self, query: &[u8]) -> Result<Vec<u8>> {
         let mut last_err = None;
         let deadline = Instant::now() + UPSTREAM_TIMEOUT;
 
         for upstream in &self.upstreams {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                warn!(upstream = upstream.label(), "skipping upstream, overall query deadline already exceeded");
+                warn!(
+                    upstream = upstream.label(),
+                    "skipping upstream, overall query deadline already exceeded"
+                );
                 last_err = Some(anyhow!("timed out querying {}", upstream.label()));
                 break;
             }
@@ -620,7 +687,11 @@ impl<U: Upstream> MultiUpstream<U> {
             match timeout(remaining, upstream.resolve(query)).await {
                 Ok(Ok(response)) => return Ok(response),
                 Ok(Err(err)) => {
-                    warn!(upstream = upstream.label(), error = format!("{err:#}"), "upstream query failed");
+                    warn!(
+                        upstream = upstream.label(),
+                        error = format!("{err:#}"),
+                        "upstream query failed"
+                    );
                     last_err = Some(err);
                 }
                 Err(_) => {
@@ -638,7 +709,7 @@ impl<U: Upstream> MultiUpstream<U> {
     /// request; unlike `Sequential`, one slow-but-not-failed upstream cannot
     /// consume the whole client-visible timeout before a healthy fallback is
     /// tried.
-    async fn resolve_hedged(&self, query: &Message) -> Result<Message> {
+    async fn resolve_hedged(&self, query: &[u8]) -> Result<Vec<u8>> {
         if self.upstreams.is_empty() {
             bail!("no upstream resolvers configured");
         }
@@ -691,7 +762,7 @@ impl<U: Upstream> MultiUpstream<U> {
         }
     }
 
-    async fn resolve_race(&self, query: &Message) -> Result<Message> {
+    async fn resolve_race(&self, query: &[u8]) -> Result<Vec<u8>> {
         if self.upstreams.is_empty() {
             bail!("no upstream resolvers configured");
         }
@@ -701,19 +772,28 @@ impl<U: Upstream> MultiUpstream<U> {
                 match timeout(UPSTREAM_TIMEOUT, upstream.resolve(query)).await {
                     Ok(Ok(response)) => Ok(response),
                     Ok(Err(err)) => {
-                        warn!(upstream = upstream.label(), error = format!("{err:#}"), "upstream query failed (race)");
+                        warn!(
+                            upstream = upstream.label(),
+                            error = format!("{err:#}"),
+                            "upstream query failed (race)"
+                        );
                         Err(err)
                     }
                     Err(_) => {
-                        warn!(upstream = upstream.label(), "upstream query timed out (race)");
+                        warn!(
+                            upstream = upstream.label(),
+                            "upstream query timed out (race)"
+                        );
                         Err(anyhow!("timed out querying {}", upstream.label()))
                     }
                 }
             };
-            Box::pin(fut) as Pin<Box<dyn Future<Output = Result<Message>> + Send + '_>>
+            Box::pin(fut) as Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + '_>>
         });
 
-        select_ok(futures).await.map(|(response, _still_running)| response)
+        select_ok(futures)
+            .await
+            .map(|(response, _still_running)| response)
     }
 }
 
@@ -721,7 +801,10 @@ impl<U: Upstream> MultiUpstream<U> {
 /// healthy reconnects skip system DNS; failed initial resolution falls back to
 /// lazy dialing, keeping unrelated listeners available. DoH uses reqwest's
 /// resolver cache so addresses can rotate after TTL expiry.
-pub async fn build(configs: &[UpstreamConfig], strategy: UpstreamStrategy) -> Result<MultiUpstream<SingleUpstream>> {
+pub async fn build(
+    configs: &[UpstreamConfig],
+    strategy: UpstreamStrategy,
+) -> Result<MultiUpstream<SingleUpstream>> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let tls_config = Arc::new(
@@ -749,12 +832,18 @@ pub async fn build(configs: &[UpstreamConfig], strategy: UpstreamStrategy) -> Re
         // Keepalive is what actually holds the connection open now, so
         // don't let the pool's own idle timer reap a healthy one first.
         .pool_idle_timeout(None);
-    let doh_http = doh_builder.build().context("failed to build upstream DoH HTTP client")?;
+    let doh_http = doh_builder
+        .build()
+        .context("failed to build upstream DoH HTTP client")?;
 
     let mut upstreams = Vec::with_capacity(configs.len());
     for cfg in configs {
         let single = match cfg {
-            UpstreamConfig::Dot { host, port, tls_name } => {
+            UpstreamConfig::Dot {
+                host,
+                port,
+                tls_name,
+            } => {
                 let server_name = ServerName::try_from(tls_name.clone())
                     .with_context(|| format!("invalid upstream tls_name: {tls_name}"))?;
                 let addresses = match resolve_addresses(host, *port).await {
@@ -796,11 +885,14 @@ async fn resolve_addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
     if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
-    let addresses: Vec<_> = timeout(ADDRESS_RESOLUTION_TIMEOUT, tokio::net::lookup_host((host, port)))
-        .await
-        .with_context(|| format!("timed out resolving upstream host {host}"))?
-        .with_context(|| format!("failed to resolve upstream host {host}"))?
-        .collect();
+    let addresses: Vec<_> = timeout(
+        ADDRESS_RESOLUTION_TIMEOUT,
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    .with_context(|| format!("timed out resolving upstream host {host}"))?
+    .with_context(|| format!("failed to resolve upstream host {host}"))?
+    .collect();
     if addresses.is_empty() {
         bail!("upstream host {host} resolved to no addresses");
     }
@@ -819,7 +911,11 @@ async fn query_doh(http: &reqwest::Client, url: &str, wire: Bytes) -> Result<Vec
         // failing the query outright. Don't retry real HTTP error statuses -
         // that's not a connection problem and won't fix itself.
         Err(err) if is_retryable(&err) => {
-            warn!(upstream = url, error = describe_std_error(&err), "DoH connection failed, retrying once");
+            warn!(
+                upstream = url,
+                error = describe_std_error(&err),
+                "DoH connection failed, retrying once"
+            );
             send_doh(http, url, wire)
                 .await
                 .with_context(|| format!("DoH request to {url} failed (after retry)"))
@@ -847,7 +943,11 @@ fn describe_std_error(err: &(dyn std::error::Error + 'static)) -> String {
     parts.join(": ")
 }
 
-async fn send_doh(http: &reqwest::Client, url: &str, wire: Bytes) -> Result<Vec<u8>, reqwest::Error> {
+async fn send_doh(
+    http: &reqwest::Client,
+    url: &str,
+    wire: Bytes,
+) -> Result<Vec<u8>, reqwest::Error> {
     let resp = http
         .post(url)
         .header("content-type", "application/dns-message")
@@ -867,17 +967,17 @@ mod tests {
     use std::time::Duration as StdDuration;
 
     #[cfg(feature = "doh")]
+    use axum::Router;
+    #[cfg(feature = "doh")]
     use axum::body::Body;
     #[cfg(feature = "doh")]
     use axum::extract::State;
     #[cfg(feature = "doh")]
-    use axum::http::{header, StatusCode};
+    use axum::http::{StatusCode, header};
     #[cfg(feature = "doh")]
     use axum::response::{IntoResponse, Response};
     #[cfg(feature = "doh")]
     use axum::routing::post;
-    #[cfg(feature = "doh")]
-    use axum::Router;
     #[cfg(feature = "doh")]
     use axum_server::tls_rustls::RustlsConfig;
     use futures_util::FutureExt;
@@ -892,7 +992,10 @@ mod tests {
     fn test_query() -> Message {
         let mut msg = Message::query();
         msg.metadata.id = 4242;
-        msg.add_query(Query::query(Name::from_ascii("example.com.").unwrap(), RecordType::A));
+        msg.add_query(Query::query(
+            Name::from_ascii("example.com.").unwrap(),
+            RecordType::A,
+        ));
         msg
     }
 
@@ -910,10 +1013,19 @@ mod tests {
         let pool = MultiUpstream::new(vec![bad, good], Strategy::Sequential);
 
         let query = test_query();
-        let response = pool.resolve(&query).await.expect("should fall back to the working upstream");
+        let response = pool
+            .resolve(&query)
+            .await
+            .expect("should fall back to the working upstream");
 
-        assert_eq!(only_answer_ip(&response), "10.0.0.1".parse::<std::net::Ipv4Addr>().unwrap());
-        assert_eq!(response.metadata.id, query.metadata.id, "caller's ID must be restored");
+        assert_eq!(
+            only_answer_ip(&response),
+            "10.0.0.1".parse::<std::net::Ipv4Addr>().unwrap()
+        );
+        assert_eq!(
+            response.metadata.id, query.metadata.id,
+            "caller's ID must be restored"
+        );
         assert_eq!(pool.upstreams[0].calls(), 1);
         assert_eq!(pool.upstreams[1].calls(), 1);
     }
@@ -926,9 +1038,16 @@ mod tests {
 
         let response = pool.resolve(&test_query()).await.unwrap();
 
-        assert_eq!(only_answer_ip(&response), "10.0.0.2".parse::<std::net::Ipv4Addr>().unwrap());
+        assert_eq!(
+            only_answer_ip(&response),
+            "10.0.0.2".parse::<std::net::Ipv4Addr>().unwrap()
+        );
         assert_eq!(pool.upstreams[0].calls(), 1);
-        assert_eq!(pool.upstreams[1].calls(), 0, "second upstream should never be queried after a success");
+        assert_eq!(
+            pool.upstreams[1].calls(),
+            0,
+            "second upstream should never be queried after a success"
+        );
     }
 
     #[tokio::test]
@@ -939,7 +1058,10 @@ mod tests {
         );
 
         let err = pool.resolve(&test_query()).await.unwrap_err();
-        assert!(err.to_string().contains('b'), "should surface the last upstream's error");
+        assert!(
+            err.to_string().contains('b'),
+            "should surface the last upstream's error"
+        );
     }
 
     #[tokio::test]
@@ -950,7 +1072,10 @@ mod tests {
 
         let response = pool.resolve(&test_query()).await.unwrap();
 
-        assert_eq!(only_answer_ip(&response), "1.1.1.1".parse::<std::net::Ipv4Addr>().unwrap());
+        assert_eq!(
+            only_answer_ip(&response),
+            "1.1.1.1".parse::<std::net::Ipv4Addr>().unwrap()
+        );
         assert_eq!(pool.upstreams[0].calls(), 1);
         assert_eq!(
             pool.upstreams[1].calls(),
@@ -961,14 +1086,18 @@ mod tests {
 
     #[tokio::test]
     async fn hedged_uses_fallback_without_waiting_for_slow_preferred() {
-        let preferred = FakeUpstream::answering("preferred", "1.1.1.1".parse().unwrap()).with_delay(StdDuration::from_millis(200));
+        let preferred = FakeUpstream::answering("preferred", "1.1.1.1".parse().unwrap())
+            .with_delay(StdDuration::from_millis(200));
         let fallback = FakeUpstream::answering("fallback", "9.9.9.9".parse().unwrap());
         let pool = MultiUpstream::new(vec![preferred, fallback], Strategy::Hedged);
 
         let started = Instant::now();
         let response = pool.resolve(&test_query()).await.unwrap();
 
-        assert_eq!(only_answer_ip(&response), "9.9.9.9".parse::<std::net::Ipv4Addr>().unwrap());
+        assert_eq!(
+            only_answer_ip(&response),
+            "9.9.9.9".parse::<std::net::Ipv4Addr>().unwrap()
+        );
         assert!(
             started.elapsed() < StdDuration::from_millis(150),
             "fallback should win shortly after the hedge delay rather than waiting 200ms for the preferred upstream"
@@ -990,7 +1119,10 @@ mod tests {
             .expect("an immediate failure must not leave the fallback behind the hedge timer")
             .expect("fallback should answer");
 
-        assert_eq!(only_answer_ip(&response), "9.9.9.9".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(
+            only_answer_ip(&response),
+            "9.9.9.9".parse::<Ipv4Addr>().unwrap()
+        );
         assert_eq!(pool.upstreams[0].calls(), 1);
         assert_eq!(pool.upstreams[1].calls(), 1);
     }
@@ -1009,28 +1141,39 @@ mod tests {
             .expect("immediate failures must not wait for a hedge timer")
             .expect_err("all failed upstreams must return an error");
 
-        assert!(err.to_string().contains('b'), "should surface the last upstream's error");
+        assert!(
+            err.to_string().contains('b'),
+            "should surface the last upstream's error"
+        );
     }
 
     #[tokio::test]
     async fn race_returns_the_fastest_success() {
-        let slow = FakeUpstream::answering("slow", "10.0.0.4".parse().unwrap()).with_delay(StdDuration::from_millis(200));
+        let slow = FakeUpstream::answering("slow", "10.0.0.4".parse().unwrap())
+            .with_delay(StdDuration::from_millis(200));
         let fast = FakeUpstream::answering("fast", "10.0.0.5".parse().unwrap());
         let pool = MultiUpstream::new(vec![slow, fast], Strategy::Race);
 
         let response = pool.resolve(&test_query()).await.unwrap();
-        assert_eq!(only_answer_ip(&response), "10.0.0.5".parse::<std::net::Ipv4Addr>().unwrap());
+        assert_eq!(
+            only_answer_ip(&response),
+            "10.0.0.5".parse::<std::net::Ipv4Addr>().unwrap()
+        );
     }
 
     #[tokio::test]
     async fn race_falls_back_when_the_faster_upstream_fails() {
         let fast_but_broken = FakeUpstream::failing("fast_but_broken");
         let slower_but_working =
-            FakeUpstream::answering("slower_but_working", "10.0.0.6".parse().unwrap()).with_delay(StdDuration::from_millis(50));
+            FakeUpstream::answering("slower_but_working", "10.0.0.6".parse().unwrap())
+                .with_delay(StdDuration::from_millis(50));
         let pool = MultiUpstream::new(vec![fast_but_broken, slower_but_working], Strategy::Race);
 
         let response = pool.resolve(&test_query()).await.unwrap();
-        assert_eq!(only_answer_ip(&response), "10.0.0.6".parse::<std::net::Ipv4Addr>().unwrap());
+        assert_eq!(
+            only_answer_ip(&response),
+            "10.0.0.6".parse::<std::net::Ipv4Addr>().unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1057,7 +1200,10 @@ mod tests {
         Message::from_vec(&wire).unwrap()
     }
 
-    async fn write_dot_response(stream: &mut (impl tokio::io::AsyncWrite + Unpin), query: &Message) {
+    async fn write_dot_response(
+        stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+        query: &Message,
+    ) {
         let mut response = Message::response(query.metadata.id, OpCode::Query);
         response.add_query(query.queries[0].clone());
         response.add_answer(Record::from_rdata(
@@ -1066,7 +1212,10 @@ mod tests {
             RData::A(A::from(Ipv4Addr::new(9, 9, 9, 9))),
         ));
         let wire = response.to_vec().unwrap();
-        stream.write_all(&(wire.len() as u16).to_be_bytes()).await.unwrap();
+        stream
+            .write_all(&(wire.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
         stream.write_all(&wire).await.unwrap();
         stream.flush().await.unwrap();
     }
@@ -1076,13 +1225,22 @@ mod tests {
     /// `close_after_one` is set, the connection is dropped right after the
     /// first response (simulating a server that closed an idle keep-alive
     /// connection) instead of looping to serve more queries on it.
-    async fn mock_dot_server(listener: TcpListener, acceptor: tokio_rustls::TlsAcceptor, accepts: Arc<AtomicUsize>, close_after_one: bool) {
+    async fn mock_dot_server(
+        listener: TcpListener,
+        acceptor: tokio_rustls::TlsAcceptor,
+        accepts: Arc<AtomicUsize>,
+        close_after_one: bool,
+    ) {
         loop {
-            let Ok((tcp, _)) = listener.accept().await else { return };
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
             accepts.fetch_add(1, Ordering::SeqCst);
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
-                let Ok(mut tls) = acceptor.accept(tcp).await else { return };
+                let Ok(mut tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
                 loop {
                     let mut len_buf = [0u8; 2];
                     if tls.read_exact(&mut len_buf).await.is_err() {
@@ -1093,13 +1251,22 @@ mod tests {
                     if tls.read_exact(&mut buf).await.is_err() {
                         return;
                     }
-                    let Ok(query) = Message::from_vec(&buf) else { return };
+                    let Ok(query) = Message::from_vec(&buf) else {
+                        return;
+                    };
                     let mut response = Message::response(query.metadata.id, OpCode::Query);
                     response.add_query(query.queries[0].clone());
-                    response.add_answer(Record::from_rdata(query.queries[0].name.clone(), 60, RData::A(A::from(Ipv4Addr::new(9, 9, 9, 9)))));
+                    response.add_answer(Record::from_rdata(
+                        query.queries[0].name.clone(),
+                        60,
+                        RData::A(A::from(Ipv4Addr::new(9, 9, 9, 9))),
+                    ));
                     let wire = response.to_vec().unwrap();
                     let resp_len = (wire.len() as u16).to_be_bytes();
-                    if tls.write_all(&resp_len).await.is_err() || tls.write_all(&wire).await.is_err() || tls.flush().await.is_err() {
+                    if tls.write_all(&resp_len).await.is_err()
+                        || tls.write_all(&wire).await.is_err()
+                        || tls.flush().await.is_err()
+                    {
                         return;
                     }
                     if close_after_one {
@@ -1144,11 +1311,16 @@ mod tests {
         assert!(first.await.unwrap_err().is_cancelled());
 
         let mut second_query = test_query();
-        second_query.queries[0] = Query::query(Name::from_ascii("second.example.").unwrap(), RecordType::A);
+        second_query.queries[0] =
+            Query::query(Name::from_ascii("second.example.").unwrap(), RecordType::A);
         let response = pool.query(&second_query).await.unwrap();
 
         assert_eq!(only_answer_ip(&response), Ipv4Addr::new(9, 9, 9, 9));
-        assert_eq!(accepts.load(Ordering::SeqCst), 1, "late response for a cancelled query must not force a reconnect");
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "late response for a cancelled query must not force a reconnect"
+        );
     }
 
     #[tokio::test]
@@ -1157,7 +1329,12 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let accepts = Arc::new(AtomicUsize::new(0));
-        tokio::spawn(mock_dot_server(listener, tls.acceptor, Arc::clone(&accepts), false));
+        tokio::spawn(mock_dot_server(
+            listener,
+            tls.acceptor,
+            Arc::clone(&accepts),
+            false,
+        ));
 
         let pool = Arc::new(DotPool::new(
             "127.0.0.1".to_string(),
@@ -1167,10 +1344,14 @@ mod tests {
             tls.connector,
         ));
         let queries: Vec<_> = (0..100).map(|_| test_query()).collect();
-        let results = futures_util::future::join_all(queries.iter().map(|query| pool.query(query))).await;
+        let results =
+            futures_util::future::join_all(queries.iter().map(|query| pool.query(query))).await;
 
         for response in results {
-            assert_eq!(only_answer_ip(&response.unwrap()), Ipv4Addr::new(9, 9, 9, 9));
+            assert_eq!(
+                only_answer_ip(&response.unwrap()),
+                Ipv4Addr::new(9, 9, 9, 9)
+            );
         }
         assert_eq!(
             accepts.load(Ordering::SeqCst),
@@ -1185,7 +1366,12 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let accepts = Arc::new(AtomicUsize::new(0));
-        tokio::spawn(mock_dot_server(listener, tls.acceptor, Arc::clone(&accepts), true));
+        tokio::spawn(mock_dot_server(
+            listener,
+            tls.acceptor,
+            Arc::clone(&accepts),
+            true,
+        ));
 
         let pool = Arc::new(DotPool::new(
             "127.0.0.1".to_string(),
@@ -1220,7 +1406,10 @@ mod tests {
 
         let id = next_available_id(&pending, 7);
 
-        assert_eq!(id, 9, "ID allocation must skip every active waiter rather than overwrite one");
+        assert_eq!(
+            id, 9,
+            "ID allocation must skip every active waiter rather than overwrite one"
+        );
     }
 
     #[tokio::test]
@@ -1229,7 +1418,12 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let accepts = Arc::new(AtomicUsize::new(0));
-        tokio::spawn(mock_dot_server(listener, tls.acceptor, Arc::clone(&accepts), false));
+        tokio::spawn(mock_dot_server(
+            listener,
+            tls.acceptor,
+            Arc::clone(&accepts),
+            false,
+        ));
 
         let upstream = SingleUpstream {
             label: "dot://test".to_string(),
@@ -1244,12 +1438,20 @@ mod tests {
         let pool = MultiUpstream::new(vec![upstream], Strategy::Sequential);
 
         pool.warm_all().await;
-        assert_eq!(accepts.load(Ordering::SeqCst), 1, "warming should have dialed the upstream");
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "warming should have dialed the upstream"
+        );
 
         // The warmed connection must be parked for reuse, not left dangling:
         // a real query after warming should not dial a second time.
         pool.resolve(&test_query()).await.unwrap();
-        assert_eq!(accepts.load(Ordering::SeqCst), 1, "the first real query should reuse the warmed connection, not redial");
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "the first real query should reuse the warmed connection, not redial"
+        );
     }
 
     #[tokio::test]
@@ -1263,7 +1465,9 @@ mod tests {
                 vec!["127.0.0.1:1".parse().unwrap()].into_boxed_slice(),
                 ServerName::try_from("localhost").unwrap(),
                 TlsConnector::from(Arc::new(
-                    rustls::ClientConfig::builder().with_root_certificates(rustls::RootCertStore::empty()).with_no_client_auth(),
+                    rustls::ClientConfig::builder()
+                        .with_root_certificates(rustls::RootCertStore::empty())
+                        .with_no_client_auth(),
                 )),
             ))),
         };
@@ -1291,18 +1495,24 @@ mod tests {
     }
 
     #[cfg(feature = "doh")]
-    async fn doh_mock_handler(State((counter, mode)): State<(Arc<AtomicUsize>, DohMockMode)>) -> Response {
+    async fn doh_mock_handler(
+        State((counter, mode)): State<(Arc<AtomicUsize>, DohMockMode)>,
+    ) -> Response {
         let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
         match mode {
             DohMockMode::NeverFinishBody => {
-                let body = futures_util::stream::pending::<std::result::Result<axum::body::Bytes, std::io::Error>>();
+                let body = futures_util::stream::pending::<
+                    std::result::Result<axum::body::Bytes, std::io::Error>,
+                >();
                 Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "application/dns-message")
                     .body(Body::from_stream(body))
                     .unwrap()
             }
-            DohMockMode::AlwaysServerError => (StatusCode::INTERNAL_SERVER_ERROR, "mock upstream failure").into_response(),
+            DohMockMode::AlwaysServerError => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "mock upstream failure").into_response()
+            }
             DohMockMode::FailFirstBodyThenSucceed if n == 1 => {
                 let chunks: Vec<std::result::Result<axum::body::Bytes, std::io::Error>> = vec![
                     Ok(axum::body::Bytes::from_static(b"\x00\x01")),
@@ -1314,18 +1524,26 @@ mod tests {
                     .body(Body::from_stream(futures_util::stream::iter(chunks)))
                     .unwrap()
             }
-            DohMockMode::FailFirstBodyThenSucceed => {
-                (StatusCode::OK, [(header::CONTENT_TYPE, "application/dns-message")], b"good-response".to_vec()).into_response()
-            }
+            DohMockMode::FailFirstBodyThenSucceed => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/dns-message")],
+                b"good-response".to_vec(),
+            )
+                .into_response(),
         }
     }
 
     #[cfg(feature = "doh")]
     /// Binds a self-signed-TLS mock DoH server on an OS-assigned port and
     /// returns its address plus a shared counter of requests it has received.
-    async fn spawn_doh_mock(tls_config: Arc<rustls::ServerConfig>, mode: DohMockMode) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+    async fn spawn_doh_mock(
+        tls_config: Arc<rustls::ServerConfig>,
+        mode: DohMockMode,
+    ) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
         let counter = Arc::new(AtomicUsize::new(0));
-        let app = Router::new().route("/dns-query", post(doh_mock_handler)).with_state((Arc::clone(&counter), mode));
+        let app = Router::new()
+            .route("/dns-query", post(doh_mock_handler))
+            .with_state((Arc::clone(&counter), mode));
 
         let handle = axum_server::Handle::new();
         let rustls_config = RustlsConfig::from_config(tls_config);
@@ -1336,13 +1554,17 @@ mod tests {
                 .serve(app.into_make_service())
                 .await;
         });
-        let addr = handle.listening().await.expect("mock DoH server failed to bind");
+        let addr = handle
+            .listening()
+            .await
+            .expect("mock DoH server failed to bind");
         (addr, counter)
     }
 
     #[cfg(feature = "doh")]
     fn doh_test_client(tls: &test_tls::TestTls, timeout: StdDuration) -> reqwest::Client {
-        let cert = reqwest::Certificate::from_pem(&tls.cert_pem).expect("failed to parse generated test cert as PEM");
+        let cert = reqwest::Certificate::from_pem(&tls.cert_pem)
+            .expect("failed to parse generated test cert as PEM");
         reqwest::Client::builder()
             .add_root_certificate(cert)
             .timeout(timeout)
@@ -1355,13 +1577,20 @@ mod tests {
     async fn doh_retries_once_after_a_body_read_failure_then_succeeds() {
         let tls = test_tls::generate("127.0.0.1");
         let http = doh_test_client(&tls, StdDuration::from_secs(5));
-        let (addr, counter) = spawn_doh_mock(tls.server_config, DohMockMode::FailFirstBodyThenSucceed).await;
+        let (addr, counter) =
+            spawn_doh_mock(tls.server_config, DohMockMode::FailFirstBodyThenSucceed).await;
 
         let url = format!("https://127.0.0.1:{}/dns-query", addr.port());
-        let response = query_doh(&http, &url, Bytes::from_static(b"query-bytes")).await.expect("should succeed after retrying once");
+        let response = query_doh(&http, &url, Bytes::from_static(b"query-bytes"))
+            .await
+            .expect("should succeed after retrying once");
 
         assert_eq!(response, b"good-response");
-        assert_eq!(counter.load(Ordering::SeqCst), 2, "exactly one retry should have been attempted");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "exactly one retry should have been attempted"
+        );
     }
 
     #[cfg(feature = "doh")]
@@ -1377,10 +1606,16 @@ mod tests {
             .expect_err("a response body that never finishes must time out");
 
         assert!(
-            err.chain().any(|source| source.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout)),
+            err.chain().any(|source| source
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout)),
             "error chain should preserve the reqwest timeout"
         );
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "an exhausted request timeout must not be retried");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "an exhausted request timeout must not be retried"
+        );
     }
 
     #[cfg(feature = "doh")]
@@ -1388,12 +1623,19 @@ mod tests {
     async fn doh_does_not_retry_a_real_http_error_status() {
         let tls = test_tls::generate("127.0.0.1");
         let http = doh_test_client(&tls, StdDuration::from_secs(5));
-        let (addr, counter) = spawn_doh_mock(tls.server_config, DohMockMode::AlwaysServerError).await;
+        let (addr, counter) =
+            spawn_doh_mock(tls.server_config, DohMockMode::AlwaysServerError).await;
 
         let url = format!("https://127.0.0.1:{}/dns-query", addr.port());
-        let err = query_doh(&http, &url, Bytes::from_static(b"query-bytes")).await.expect_err("a real HTTP error status must surface as an error");
+        let err = query_doh(&http, &url, Bytes::from_static(b"query-bytes"))
+            .await
+            .expect_err("a real HTTP error status must surface as an error");
 
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "a real HTTP error status must not be retried");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "a real HTTP error status must not be retried"
+        );
         assert!(!format!("{err:#}").is_empty());
     }
 }

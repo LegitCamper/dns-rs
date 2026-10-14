@@ -7,3 +7,4 @@ mod test_support;
 #[cfg(test)]
 mod test_tls;
 pub mod upstream;
+pub mod wire;

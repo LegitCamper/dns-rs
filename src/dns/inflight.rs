@@ -1,20 +1,20 @@
-use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use hickory_proto::rr::{DNSClass, RecordType};
+use rustc_hash::FxHashMap;
 use tokio::sync::OnceCell;
 
 use super::inline_name::InlineName;
 
-type FlightKey = (RecordType, DNSClass, InlineName);
+type FlightKey = (RecordType, DNSClass, u8, InlineName);
 
 /// Coalesces concurrent identical cache-miss queries into a single upstream
 /// fetch. Whichever caller registers first runs `fetch`; the rest just await
 /// the same `OnceCell`, which guarantees it runs at most once.
 #[derive(Default)]
 pub struct InFlightRegistry {
-    entries: Mutex<HashMap<FlightKey, Arc<OnceCell<Vec<u8>>>>>,
+    entries: Mutex<FxHashMap<FlightKey, Arc<OnceCell<Vec<u8>>>>>,
 }
 
 impl InFlightRegistry {
@@ -22,17 +22,24 @@ impl InFlightRegistry {
         Self::default()
     }
 
-    pub async fn dedup<F, Fut>(&self, name: &str, record_type: RecordType, dns_class: DNSClass, fetch: F) -> Vec<u8>
+    pub async fn dedup_with_flags<F, Fut>(
+        &self,
+        name: &[u8],
+        record_type: RecordType,
+        dns_class: DNSClass,
+        flags: u8,
+        fetch: F,
+    ) -> Vec<u8>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Vec<u8>>,
     {
         // A name too long to key on can't be deduped; just fetch directly
         // rather than silently skipping coalescing for it.
-        let Some(inline_name) = InlineName::new(name) else {
+        let Some(inline_name) = InlineName::from_bytes(name) else {
             return fetch().await;
         };
-        let key = (record_type, dns_class, inline_name);
+        let key = (record_type, dns_class, flags, inline_name);
 
         let cell = self.cell_for(key);
         let wire = cell.get_or_init(fetch).await.clone();
@@ -45,7 +52,12 @@ impl InFlightRegistry {
     }
 
     fn cell_for(&self, key: FlightKey) -> Arc<OnceCell<Vec<u8>>> {
-        self.entries.lock().unwrap().entry(key).or_insert_with(|| Arc::new(OnceCell::new())).clone()
+        self.entries
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_insert_with(|| Arc::new(OnceCell::new()))
+            .clone()
     }
 
     fn remove(&self, key: &FlightKey) {

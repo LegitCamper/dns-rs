@@ -16,22 +16,20 @@ pub(crate) struct InlineName {
 }
 
 impl InlineName {
-    pub(crate) fn new(name: &str) -> Option<Self> {
+    pub(crate) fn from_bytes(name: &[u8]) -> Option<Self> {
         if name.len() > MAX_NAME_LEN {
             return None;
         }
         let mut bytes = [0u8; MAX_NAME_LEN];
-        bytes[..name.len()].copy_from_slice(name.as_bytes());
-        Some(Self { len: name.len() as u8, bytes })
+        bytes[..name.len()].copy_from_slice(name);
+        Some(Self {
+            len: name.len() as u8,
+            bytes,
+        })
     }
 
     pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.bytes[..self.len as usize]
-    }
-
-    /// For logging only; never relied on for correctness.
-    pub(crate) fn as_str(&self) -> &str {
-        std::str::from_utf8(self.as_bytes()).unwrap_or("<invalid-utf8>")
     }
 }
 

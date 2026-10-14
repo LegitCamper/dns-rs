@@ -25,7 +25,10 @@ pub(crate) struct TestUpstream {
 enum Outcome {
     Answer(Ipv4Addr),
     Fail,
-    Negative { response_code: ResponseCode, soa: Option<(u32, u32)> },
+    Negative {
+        response_code: ResponseCode,
+        soa: Option<(u32, u32)>,
+    },
 }
 
 impl TestUpstream {
@@ -89,17 +92,22 @@ impl Upstream for TestUpstream {
         &self.label
     }
 
-    async fn resolve(&self, query: &Message) -> Result<Message> {
+    async fn resolve(&self, query: &[u8]) -> Result<Vec<u8>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if self.delay > Duration::ZERO {
             tokio::time::sleep(self.delay).await;
         }
-        match &self.outcome {
+        let query = Message::from_vec(query)?;
+        let response = match &self.outcome {
             Outcome::Answer(ip) => {
                 let mut response = Message::response(query.metadata.id, OpCode::Query);
                 response.add_query(query.queries[0].clone());
-                response.add_answer(Record::from_rdata(query.queries[0].name.clone(), 60, RData::A(A::from(*ip))));
-                Ok(response)
+                response.add_answer(Record::from_rdata(
+                    query.queries[0].name.clone(),
+                    60,
+                    RData::A(A::from(*ip)),
+                ));
+                response
             }
             Outcome::Negative { response_code, soa } => {
                 let mut response = Message::response(query.metadata.id, OpCode::Query);
@@ -120,9 +128,10 @@ impl Upstream for TestUpstream {
                         )),
                     ));
                 }
-                Ok(response)
+                response
             }
-            Outcome::Fail => Err(anyhow::anyhow!("{} refused to answer", self.label)),
-        }
+            Outcome::Fail => return Err(anyhow::anyhow!("{} refused to answer", self.label)),
+        };
+        Ok(response.to_vec()?)
     }
 }
