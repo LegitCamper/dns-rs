@@ -168,6 +168,7 @@ where
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES_PER_CONNECTION));
 
     let writer = tokio::spawn(async move {
+        let mut framed = Vec::new();
         while let Some(response) = rx.recv().await {
             let Ok(resp_len) = u16::try_from(response.len()) else {
                 // handle_query always encodes a response that fits DoT framing
@@ -177,7 +178,8 @@ where
             };
             // One write for the length prefix + body, rather than two, so
             // it's a single TCP segment instead of two back-to-back ones.
-            let mut framed = Vec::with_capacity(2 + response.len());
+            framed.clear();
+            framed.reserve(2 + response.len());
             framed.extend_from_slice(&resp_len.to_be_bytes());
             framed.extend_from_slice(&response);
             if write_half.write_all(&framed).await.is_err() || write_half.flush().await.is_err() {
@@ -215,11 +217,26 @@ where
             };
             let state = Arc::clone(&state);
             let tx = tx.clone();
-            tokio::spawn(async move {
-                let response = handle_query(&state, &buf).await;
-                let _ = tx.send(response).await;
-                drop(permit);
-            });
+            // Most queries are cache, static-host, or blocklist hits and
+            // complete without ever yielding. Poll once here so those stay
+            // in the connection task instead of paying a spawn, scheduler
+            // enqueue/dequeue, and cross-task mpsc send. A true miss parks
+            // on upstream I/O and is moved to its own task so pipelining
+            // remains concurrent.
+            let mut query = Box::pin(async move { handle_query(&state, &buf).await });
+            match futures_util::future::poll_immediate(&mut query).await {
+                Some(response) => {
+                    let _ = tx.send(response).await;
+                    drop(permit);
+                }
+                None => {
+                    tokio::spawn(async move {
+                        let response = query.await;
+                        let _ = tx.send(response).await;
+                        drop(permit);
+                    });
+                }
+            }
         }
     }
     .await;
