@@ -3,7 +3,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
 use rustc_hash::FxHasher;
 use tokio_util::sync::CancellationToken;
@@ -98,6 +98,7 @@ impl DomainIndex {
         self.len == 0
     }
 
+    #[cfg(test)]
     pub fn contains(&self, name: &str) -> bool {
         self.contains_bytes(name.as_bytes())
     }
@@ -280,7 +281,11 @@ impl BlocklistManager {
             .build()
             .expect("failed to build blocklist HTTP client");
 
-        let block = DomainSet::new(&config.urls, &config.domains, Duration::from_secs(config.refresh_interval_secs));
+        let block = DomainSet::new(
+            &config.urls,
+            &config.domains,
+            Duration::from_secs(config.refresh_interval_secs),
+        );
         let allow = DomainSet::new(
             &whitelist.urls,
             &whitelist.domains,
@@ -299,20 +304,16 @@ impl BlocklistManager {
         self.merged.clone()
     }
 
-    /// Fetches every blocklist and whitelist URL source concurrently,
-    /// publishes the merged set, then spawns a background refresh loop per
-    /// source — blocklist and whitelist sources alike, each on its own
-    /// schedule — until `shutdown` fires. A source that fails to fetch
-    /// keeps its previous contents rather than taking the server down.
+    /// Fetches sources sequentially within each direction, publishes the
+    /// merged set, then starts one refresh loop for blocklists and one for
+    /// whitelists. Sequential source processing is deliberate on the 512MB
+    /// deployment: concurrently buffering/parsing a dozen large lists made
+    /// peak memory proportional to their combined download size, and every
+    /// source loop used to rebuild the million-domain merged index again.
+    /// A failed source keeps its previous contents.
     pub async fn start(self: &Arc<Self>, shutdown: CancellationToken) {
-        let mut handles = Vec::with_capacity(self.block.sources.len() + self.allow.sources.len());
         for src in self.block.sources.iter().chain(self.allow.sources.iter()) {
-            let this = Arc::clone(self);
-            let src = Arc::clone(src);
-            handles.push(tokio::spawn(async move { this.fetch_and_store(&src).await }));
-        }
-        for h in handles {
-            let _ = h.await;
+            self.fetch_and_store(src).await;
         }
         let whitelisted = self.republish_merged();
         info!(
@@ -323,32 +324,37 @@ impl BlocklistManager {
             "initial blocklist/whitelist fetch complete"
         );
 
-        self.spawn_refresh_loops(|m| &m.block, shutdown.clone());
-        self.spawn_refresh_loops(|m| &m.allow, shutdown);
+        self.spawn_refresh_loop(|m| &m.block, shutdown.clone());
+        self.spawn_refresh_loop(|m| &m.allow, shutdown);
     }
 
-    /// Spawns one refresh loop per source in the direction `accessor`
-    /// selects (the blocklist or the whitelist). A plain fn pointer instead
-    /// of a `&DomainSet` borrow, since each loop is a `'static` spawned
-    /// task and re-derives the set it needs from `this: Arc<Self>` itself.
-    fn spawn_refresh_loops(self: &Arc<Self>, accessor: fn(&BlocklistManager) -> &DomainSet, shutdown: CancellationToken) {
-        for src in accessor(self).sources.clone() {
-            let this = Arc::clone(self);
-            let shutdown = shutdown.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = tokio::time::sleep(src.refresh_interval) => {}
-                        _ = shutdown.cancelled() => return,
-                    }
-                    this.fetch_and_store(&src).await;
-                    // Either direction refreshing can change the final
-                    // published set, so this rebuilds from both regardless
-                    // of which one just changed.
-                    this.republish_merged();
+    fn spawn_refresh_loop(
+        self: &Arc<Self>,
+        accessor: fn(&BlocklistManager) -> &DomainSet,
+        shutdown: CancellationToken,
+    ) {
+        let Some(interval) = accessor(self)
+            .sources
+            .first()
+            .map(|src| src.refresh_interval)
+        else {
+            return;
+        };
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {}
+                    _ = shutdown.cancelled() => return,
                 }
-            });
-        }
+                // One source body/index at a time; one merged rebuild after
+                // the whole direction has refreshed, not one per URL.
+                for src in &accessor(&this).sources {
+                    this.fetch_and_store(src).await;
+                }
+                this.republish_merged();
+            }
+        });
     }
 
     async fn fetch_and_store(&self, src: &Source) {
@@ -375,10 +381,13 @@ impl BlocklistManager {
         while let Some(chunk) = resp.chunk().await? {
             body.extend_from_slice(&chunk);
             if body.len() as u64 > MAX_LIST_RESPONSE_BYTES {
-                bail!("response from {url} exceeded the {MAX_LIST_RESPONSE_BYTES}-byte limit for a single domain list");
+                bail!(
+                    "response from {url} exceeded the {MAX_LIST_RESPONSE_BYTES}-byte limit for a single domain list"
+                );
             }
         }
-        let body = String::from_utf8(body).with_context(|| format!("response from {url} was not valid UTF-8"))?;
+        let body = String::from_utf8(body)
+            .with_context(|| format!("response from {url} was not valid UTF-8"))?;
         Ok(parse_list_async(&body).await)
     }
 
@@ -397,8 +406,14 @@ impl BlocklistManager {
         let allow_sources = self.allow.snapshot();
 
         let allow = DomainIndex::merged(&self.allow.inline, &allow_sources, None);
-        let expected = self.block.inline.len() + block_sources.iter().map(|s| s.len()).sum::<usize>();
-        let merged = DomainIndex::merged_with_capacity(expected, &self.block.inline, &block_sources, Some(&allow));
+        let expected =
+            self.block.inline.len() + block_sources.iter().map(|s| s.len()).sum::<usize>();
+        let merged = DomainIndex::merged_with_capacity(
+            expected,
+            &self.block.inline,
+            &block_sources,
+            Some(&allow),
+        );
 
         let whitelisted = allow.len();
         self.merged.store(Arc::new(merged));
@@ -409,7 +424,11 @@ impl BlocklistManager {
 impl DomainIndex {
     /// Unions `inline` (already normalized) with every name in `sources`,
     /// skipping anything present in `exclude`.
-    fn merged(inline: &[String], sources: &[Arc<DomainIndex>], exclude: Option<&DomainIndex>) -> Self {
+    fn merged(
+        inline: &[String],
+        sources: &[Arc<DomainIndex>],
+        exclude: Option<&DomainIndex>,
+    ) -> Self {
         let expected = inline.len() + sources.iter().map(|s| s.len()).sum::<usize>();
         Self::merged_with_capacity(expected, inline, sources, exclude)
     }
@@ -521,7 +540,11 @@ fn insert_if_valid(index: &mut DomainIndex, domain: &str, buf: &mut [u8; MAX_NAM
         return;
     };
     let normalized = &buf[..len];
-    if normalized == b"." || EXCLUDED_HOSTNAMES.iter().any(|h| h.as_bytes() == normalized) {
+    if normalized == b"."
+        || EXCLUDED_HOSTNAMES
+            .iter()
+            .any(|h| h.as_bytes() == normalized)
+    {
         return;
     }
     index.insert_normalized(normalized);
@@ -553,7 +576,8 @@ fn looks_like_domain(s: &str) -> bool {
     let trimmed = s.trim_matches('.');
     !trimmed.is_empty()
         && trimmed.contains('.')
-        && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
 }
 
 #[cfg(test)]
@@ -579,7 +603,12 @@ mod tests {
     /// Simulates a source fetch landing entries directly (bypassing real
     /// HTTP), then re-derives the merged set the same way a background
     /// refresh would.
-    fn land_fetch(manager: &BlocklistManager, set: &DomainSet, source_index: usize, domains: &[&str]) {
+    fn land_fetch(
+        manager: &BlocklistManager,
+        set: &DomainSet,
+        source_index: usize,
+        domains: &[&str],
+    ) {
         *set.sources[source_index].set.lock().unwrap() = Arc::new(domains.iter().collect());
         manager.republish_merged();
     }
@@ -596,11 +625,17 @@ mod tests {
 
     #[test]
     fn inline_whitelist_domains_remove_domains_from_the_merged_set_even_after_refresh() {
-        let config = blocklists_config(vec!["https://example.invalid/list.txt".to_string()], vec![]);
+        let config =
+            blocklists_config(vec!["https://example.invalid/list.txt".to_string()], vec![]);
         let whitelist = whitelist_config(vec![], vec!["s.youtube.com".to_string()]);
         let manager = BlocklistManager::new(&config, &whitelist);
 
-        land_fetch(&manager, &manager.block, 0, &["ads.example.com.", "s.youtube.com."]);
+        land_fetch(
+            &manager,
+            &manager.block,
+            0,
+            &["ads.example.com.", "s.youtube.com."],
+        );
 
         let merged = manager.merged_set();
         assert!(merged.load().contains("ads.example.com."));
@@ -612,11 +647,22 @@ mod tests {
 
     #[test]
     fn whitelist_urls_remove_domains_from_the_merged_set_just_like_inline_whitelist_domains() {
-        let config = blocklists_config(vec!["https://example.invalid/block.txt".to_string()], vec![]);
-        let whitelist = whitelist_config(vec!["https://example.invalid/allow.txt".to_string()], vec![]);
+        let config = blocklists_config(
+            vec!["https://example.invalid/block.txt".to_string()],
+            vec![],
+        );
+        let whitelist = whitelist_config(
+            vec!["https://example.invalid/allow.txt".to_string()],
+            vec![],
+        );
         let manager = BlocklistManager::new(&config, &whitelist);
 
-        land_fetch(&manager, &manager.block, 0, &["ads.example.com.", "s.youtube.com."]);
+        land_fetch(
+            &manager,
+            &manager.block,
+            0,
+            &["ads.example.com.", "s.youtube.com."],
+        );
         land_fetch(&manager, &manager.allow, 0, &["s.youtube.com."]);
 
         let merged = manager.merged_set();
@@ -630,11 +676,20 @@ mod tests {
     #[test]
     fn a_whitelist_source_refreshing_on_its_own_can_un_block_a_domain() {
         // The domain starts out blocked (only the blocklist source has run).
-        let config = blocklists_config(vec!["https://example.invalid/block.txt".to_string()], vec![]);
-        let whitelist = whitelist_config(vec!["https://example.invalid/allow.txt".to_string()], vec![]);
+        let config = blocklists_config(
+            vec!["https://example.invalid/block.txt".to_string()],
+            vec![],
+        );
+        let whitelist = whitelist_config(
+            vec!["https://example.invalid/allow.txt".to_string()],
+            vec![],
+        );
         let manager = BlocklistManager::new(&config, &whitelist);
         land_fetch(&manager, &manager.block, 0, &["s.youtube.com."]);
-        assert!(manager.merged_set().load().contains("s.youtube.com."), "should start out blocked");
+        assert!(
+            manager.merged_set().load().contains("s.youtube.com."),
+            "should start out blocked"
+        );
 
         // The whitelist source refreshing on its own schedule (independent
         // of any blocklist refresh) must be enough to un-block it.
@@ -654,23 +709,43 @@ mod tests {
         let index: DomainIndex = names.iter().collect();
         assert_eq!(index.len(), 5_000);
         for name in &names {
-            assert!(index.contains(&normalize_name(name)), "{name} must be present after growth");
+            assert!(
+                index.contains(&normalize_name(name)),
+                "{name} must be present after growth"
+            );
         }
-        assert!(!index.contains("absent.example.com."), "a miss must terminate probing, not loop");
+        assert!(
+            !index.contains("absent.example.com."),
+            "a miss must terminate probing, not loop"
+        );
 
         // Duplicates (including case/trailing-dot variants that normalize to
         // the same name) must not grow the set.
         let deduped: DomainIndex = ["a.com", "A.com", "a.com.", ".a.com"].into_iter().collect();
-        assert_eq!(deduped.len(), 1, "normalized duplicates must collapse to one entry");
+        assert_eq!(
+            deduped.len(),
+            1,
+            "normalized duplicates must collapse to one entry"
+        );
 
         // Every stored name must come back out exactly once.
-        let mut round_tripped: Vec<String> = index.names().map(|n| String::from_utf8(n.to_vec()).unwrap()).collect();
+        let mut round_tripped: Vec<String> = index
+            .names()
+            .map(|n| String::from_utf8(n.to_vec()).unwrap())
+            .collect();
         round_tripped.sort();
         round_tripped.dedup();
-        assert_eq!(round_tripped.len(), 5_000, "names() must yield each entry exactly once");
+        assert_eq!(
+            round_tripped.len(),
+            5_000,
+            "names() must yield each entry exactly once"
+        );
 
         assert!(DomainIndex::new().is_empty());
-        assert!(!DomainIndex::new().contains("anything."), "an empty index must not match");
+        assert!(
+            !DomainIndex::new().contains("anything."),
+            "an empty index must not match"
+        );
         assert!(!index.contains(""), "an empty lookup must never match");
     }
 
@@ -678,7 +753,10 @@ mod tests {
     fn republish_merged_subtracts_whitelist_without_a_second_full_copy() {
         // Also pins the behavior the single-pass merge has to preserve: a
         // name in both directions ends up excluded.
-        let config = blocklists_config(vec!["https://example.invalid/block.txt".to_string()], vec!["inline-block.test".to_string()]);
+        let config = blocklists_config(
+            vec!["https://example.invalid/block.txt".to_string()],
+            vec!["inline-block.test".to_string()],
+        );
         let whitelist = whitelist_config(vec![], vec!["inline-block.test".to_string()]);
         let manager = BlocklistManager::new(&config, &whitelist);
         land_fetch(&manager, &manager.block, 0, &["keep.test.", "drop.test."]);
@@ -727,7 +805,10 @@ facebook.com#@##fb_header
 chatgpt.com#?#.md\\:px-\\[60px\\]:has-text(By messaging ChatGPT)
 ";
         let set = parse_list(body);
-        assert!(set.is_empty(), "cosmetic filter rules must never be treated as domains to block: {set:?}");
+        assert!(
+            set.is_empty(),
+            "cosmetic filter rules must never be treated as domains to block: {set:?}"
+        );
     }
 
     #[test]
@@ -743,12 +824,19 @@ chatgpt.com#?#.md\\:px-\\[60px\\]:has-text(By messaging ChatGPT)
         let set = parse_list(body);
         assert!(set.contains("doubleclick.net."));
         assert!(set.contains("ads.example.com."));
-        assert!(!set.contains("example.com."), "exception rules (@@) must never be treated as a block");
+        assert!(
+            !set.contains("example.com."),
+            "exception rules (@@) must never be treated as a block"
+        );
         assert!(
             !set.contains("google.com."),
             "a rule matching a specific path (^*/friendconnect.js) blocks that path, not the whole domain"
         );
-        assert_eq!(set.len(), 2, "wildcard/path rules should be skipped rather than guessed at: {set:?}");
+        assert_eq!(
+            set.len(),
+            2,
+            "wildcard/path rules should be skipped rather than guessed at: {set:?}"
+        );
     }
 
     #[test]
@@ -758,6 +846,9 @@ chatgpt.com#?#.md\\:px-\\[60px\\]:has-text(By messaging ChatGPT)
         // domain line.
         let body = "! wordpress.org https://wordpress.org/plugins/some-plugin/\n! linkedin.com\n";
         let set = parse_list(body);
-        assert!(set.is_empty(), "`!` comment lines must never be treated as domains: {set:?}");
+        assert!(
+            set.is_empty(),
+            "`!` comment lines must never be treated as domains: {set:?}"
+        );
     }
 }
