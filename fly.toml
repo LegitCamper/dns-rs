@@ -50,6 +50,7 @@ port = 853
 handlers = ['tls']
 
 [services.ports.tls_options]
+alpn = ['dot']
 versions = ['TLSv1.2', 'TLSv1.3']
 
 [[services.tcp_checks]]
