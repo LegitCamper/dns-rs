@@ -108,6 +108,30 @@ Set your Fly app name and primary region during `fly launch`; the checked-in con
 intentionally omits account-specific values. Clients use
 `https://dns.example.com/dns-query` for DoH and `dns.example.com:853` for DoT.
 
+#### Health checks and recovery
+
+`GET /healthz` checks HTTP liveness. `GET /readyz` sends a root NS query through
+the configured upstream strategy, bypassing local cache and blocklists. It
+returns HTTP 200 for a valid root NS answer, or 503 for DNS errors, malformed
+answers, or upstream failure (bounded by the normal five-second query timeout).
+Both endpoints use the DoH listener: HTTPS in the default build, HTTP behind
+platform TLS in the `certless` build. DoT-only builds have no HTTP endpoints.
+
+Fly checks `/readyz` every 15 seconds with a six-second timeout and a 30-second
+startup grace period. Failed checks remove the Machine from **DoH** routing;
+passing checks restore it. DoT retains a TCP check on port 8853, which detects
+listener reachability only. Fly service HTTP checks target their service's
+internal port, so the DoT service cannot reuse port 8053's readiness endpoint.
+Existing client connections are not migrated by routing checks.
+
+Run at least two Machines (`fly scale count 2`) to have a healthy failover target.
+Inspect checks with `fly checks list`. Fly health checks **do not restart
+Machines**; the configured `on-failure` policy retries process crashes up to
+10 times. For a running but stuck Machine, use `fly machine restart <machine-id>`.
+Automatic restarts on failed checks require an external watchdog; upstream
+outages alone should not trigger restart loops. See
+[Fly health checks](https://fly.io/docs/reference/health-checks/).
+
 <details>
 <summary>Environment variables</summary>
 

@@ -32,10 +32,10 @@ versions = ['TLSv1.2', 'TLSv1.3']
 
 [[services.http_checks]]
 interval = '15s'
-timeout = '2s'
-grace_period = '10s'
+timeout = '6s'
+grace_period = '30s'
 method = 'GET'
-path = '/healthz'
+path = '/readyz'
 protocol = 'http'
 
 [[services]]
@@ -55,7 +55,12 @@ versions = ['TLSv1.2', 'TLSv1.3']
 [[services.tcp_checks]]
 interval = '15s'
 timeout = '2s'
-grace_period = '10s'
+grace_period = '30s'
+
+# Health checks control routing; restart policy applies only after process exit.
+[[restart]]
+policy = 'on-failure'
+retries = 10
 
 [[vm]]
 size = 'shared-cpu-1x'
