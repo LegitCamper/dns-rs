@@ -8,7 +8,7 @@ trackers get dropped before they resolve, and the queries that do go upstream
 are encrypted end to end.
 
 Written in Rust: a single stripped binary, no runtime, no GC, no interpreter.
-It idles at a few MB of RAM and answers cache hits without allocating, so it's
+It idles at a few MB of RAM and answers cache hits from cached wire bytes, so it's
 happy on a Raspberry Pi, an old NUC, or a free serverless tier.
 
 ## What you get
@@ -26,8 +26,8 @@ happy on a Raspberry Pi, an old NUC, or a free serverless tier.
 - **Fast cache** with a byte budget instead of an entry count, so tiny NXDOMAIN
   answers and fat TXT records each use only what they need. Failures (NXDOMAIN
   / NODATA) get cached too, when upstream says how long that's safe.
-- **Multiple upstreams**: try them in order, or race all of them and take the
-  first answer. Duplicate in-flight queries collapse into one upstream request.
+- **Multiple upstreams**: try them in order, hedge slow requests after 25 ms,
+  or race all of them. Duplicate in-flight queries collapse into one request.
 - **Hot config reload** — edit `config.toml` and it picks up the change without
   restarting or dropping connections.
 
@@ -182,6 +182,40 @@ A DoH-only platform profile (for example Azure) uses
   reviewed by anyone but its author.
 
 ## Development
+
+### Latency tuning
+
+The Fly configuration uses `hedged` upstreams: a slow primary gets a 25 ms
+head start before the next resolver joins. `race` starts every resolver at
+once, at the cost of more upstream traffic. These settings affect cache misses,
+not the network round trip between your device and this server.
+
+Cache hits in the final 10% of TTL already trigger a background refresh. A
+one-second timer also checks the 1024 most recent entries, refreshing repeatedly
+used names in the final 5-10% of TTL (staggered per name). Names unused for five
+minutes stop refreshing. Both paths share four refresh slots, in-flight query
+deduplication, and failure backoff of roughly 1-16 seconds. Original queries,
+including EDNS options and DNSSEC flags, are retained within the cache byte
+budget; this reduces entry capacity slightly. TTLs are never extended without
+an upstream answer. Expired answers remain usable for the existing 30-second
+stale window with TTL zero.
+
+Expired cache entries are swept in batches of 256 with yields between batches.
+Blocklist refresh merges run on a blocking worker, one rebuild at a time. Dead
+upstream DoT connections are replaced by maintenance with bounded retry backoff.
+Full cache flushes are unnecessary and cause cold misses.
+
+For a short timing capture, set
+`RUST_LOG=dns_rs::dns::handler=debug,dns_rs::dns::cache=debug`.
+`DNS query complete` logs `path` (`fresh`, `stale`, `miss`, `static`, `blocked`)
+and `elapsed_us`; `upstream query complete` logs upstream wait separately.
+These are server processing times, excluding inbound TLS setup and network
+transit. Debug logging itself adds overhead; benchmark with `RUST_LOG=warn`.
+
+Inbound DoT connections still close after 120 seconds without a new query.
+Client persistent-connection mode can therefore include occasional reconnects.
+
+### Checks
 
 ```sh
 cargo test              # unit + integration tests, no network required

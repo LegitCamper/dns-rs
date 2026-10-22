@@ -1,7 +1,9 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::RData;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::config::BlockMode;
@@ -20,13 +22,70 @@ use crate::state::AppState;
 /// hits and synthesized answers allocate only their final response `Vec`;
 /// forwarded queries retain their original EDNS options byte-for-byte.
 pub async fn handle_query<U: Upstream + 'static>(state: &Arc<AppState<U>>, raw: &[u8]) -> Vec<u8> {
+    let started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
     let mut name_buf = [0u8; MAX_NAME_LEN];
     let Some(query) = wire::parse_query(raw, &mut name_buf) else {
         debug!("failed to parse incoming DNS question");
         return wire::bare_error(raw, RCODE_FORMERR);
     };
     let qname = &name_buf[..query.name_len];
-    resolve(state, raw, &query, qname).await
+    let (response, path) = resolve(state, raw, &query, qname).await;
+    if let Some(started) = started {
+        debug!(
+            path,
+            elapsed_us = started.elapsed().as_micros() as u64,
+            "DNS query complete"
+        );
+    }
+    response
+}
+
+pub fn start_refresh<U: Upstream + 'static>(state: &Arc<AppState<U>>, shutdown: CancellationToken) {
+    let state = Arc::downgrade(state);
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+            let Some(state) = state.upgrade() else { return };
+            for request in state.cache.refresh_candidates() {
+                spawn_refresh(&state, &request);
+            }
+        }
+    });
+}
+
+fn spawn_refresh<U: Upstream + 'static>(state: &Arc<AppState<U>>, raw: &[u8]) {
+    let mut name_buf = [0; MAX_NAME_LEN];
+    let Some(query) = wire::parse_query(raw, &mut name_buf) else {
+        return;
+    };
+    let name = &name_buf[..query.name_len];
+    let flags = u8::from(query.dnssec_ok) | (u8::from(query.checking_disabled) << 1);
+    let permit = state.cache.try_refresh_permit();
+    if permit.is_none() || state.blocklist.load().contains_bytes(name) {
+        state
+            .cache
+            .release_refresh_claim_with_flags(name, query.qtype, query.qclass, flags);
+        return;
+    }
+    let state = Arc::clone(state);
+    let request = raw.to_vec();
+    let name = name.to_vec();
+    tokio::spawn(async move {
+        let _permit = permit;
+        state
+            .in_flight
+            .dedup_with_flags(&name, query.qtype, query.qclass, flags, || async {
+                fetch_from_upstream(&state, &request, &name, query.qtype, query.qclass, flags).await
+            })
+            .await;
+        // Successful replacement clears the claim; failures back off before retrying.
+        state
+            .cache
+            .release_refresh_claim_with_flags(&name, query.qtype, query.qclass, flags);
+    });
 }
 
 async fn resolve<U: Upstream + 'static>(
@@ -34,7 +93,7 @@ async fn resolve<U: Upstream + 'static>(
     raw: &[u8],
     query: &ParsedQuery,
     qname: &[u8],
-) -> Vec<u8> {
+) -> (Vec<u8>, &'static str) {
     // DO and CD change the answer's DNSSEC semantics, so both belong in the
     // cache/in-flight identity. This fixes the old `(qtype,qclass,qname)`
     // cache serving a plain answer to a DNSSEC-aware query or vice versa.
@@ -44,10 +103,13 @@ async fn resolve<U: Upstream + 'static>(
     if let Some(host) = qname_str.and_then(|name| state.static_hosts.get(name)) {
         let answer =
             (query.qtype == hickory_proto::rr::RecordType::A).then_some((host.ip, host.ttl));
-        return wire::synthesize(raw, query, RCODE_NOERROR, answer);
+        return (
+            wire::synthesize(raw, query, RCODE_NOERROR, answer),
+            "static",
+        );
     }
 
-    if let Some((mut cached, should_refresh)) =
+    if let Some((mut cached, should_refresh, stale)) =
         state
             .cache
             .get_with_flags(qname, query.qtype, query.qclass, cache_flags)
@@ -56,49 +118,11 @@ async fn resolve<U: Upstream + 'static>(
         // A name can become blocked while an older allowed answer is still
         // cached. Preserve cache-until-expiry behavior, but don't refresh
         // that answer and keep bypassing the newer blocklist forever.
-        if should_refresh && state.blocklist.load().contains_bytes(qname) {
-            state.cache.release_refresh_claim_with_flags(
-                qname,
-                query.qtype,
-                query.qclass,
-                cache_flags,
-            );
-        } else if should_refresh {
-            // This is the only request-byte copy on a cache hit, and only in
-            // the final 10% of its TTL. The client still receives the cached
-            // response immediately while this refresh runs in the background.
-            let refresh_state = Arc::clone(state);
-            let refresh_raw = raw.to_vec();
-            let refresh_name = qname.to_vec();
-            let qtype = query.qtype;
-            let qclass = query.qclass;
-            tokio::spawn(async move {
-                let fetch_state = Arc::clone(&refresh_state);
-                let cache_name = refresh_name.clone();
-                refresh_state
-                    .in_flight
-                    .dedup_with_flags(
-                        &refresh_name,
-                        qtype,
-                        qclass,
-                        cache_flags,
-                        move || async move {
-                            fetch_from_upstream(
-                                &fetch_state,
-                                &refresh_raw,
-                                &cache_name,
-                                qtype,
-                                qclass,
-                                cache_flags,
-                            )
-                            .await
-                        },
-                    )
-                    .await;
-            });
+        if should_refresh {
+            spawn_refresh(state, raw);
         }
         wire::set_id(&mut cached, query.id);
-        return cached;
+        return (cached, if stale { "stale" } else { "fresh" });
     }
     debug!(qname = %String::from_utf8_lossy(qname), qtype = ?query.qtype, "cache miss");
 
@@ -110,7 +134,7 @@ async fn resolve<U: Upstream + 'static>(
             }
             BlockMode::Sinkhole => (RCODE_NOERROR, None),
         };
-        return wire::synthesize(raw, query, rcode, answer);
+        return (wire::synthesize(raw, query, rcode, answer), "blocked");
     }
 
     // Coalesce concurrent identical misses into one upstream fetch; each
@@ -122,7 +146,7 @@ async fn resolve<U: Upstream + 'static>(
         })
         .await;
     wire::set_id(&mut response, query.id);
-    response
+    (response, "miss")
 }
 
 async fn fetch_from_upstream<U: Upstream>(
@@ -133,7 +157,16 @@ async fn fetch_from_upstream<U: Upstream>(
     qclass: hickory_proto::rr::DNSClass,
     cache_flags: u8,
 ) -> Vec<u8> {
-    match state.upstreams.resolve_wire(request).await {
+    let started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
+    let result = state.upstreams.resolve_wire(request).await;
+    if let Some(started) = started {
+        debug!(
+            elapsed_us = started.elapsed().as_micros() as u64,
+            success = result.is_ok(),
+            "upstream query complete"
+        );
+    }
+    match result {
         Ok(wire) => {
             // TTL extraction is the only place on the normal forwarded path
             // that needs a structured Message. Upstream validation already
@@ -158,7 +191,8 @@ async fn fetch_from_upstream<U: Upstream>(
                         qclass,
                         cache_flags,
                         ttl,
-                        wire.clone(),
+                        &wire,
+                        request,
                     );
                 }
                 None => {
@@ -251,6 +285,40 @@ mod tests {
             RData::A(a) => a.0,
             other => panic!("expected an A record, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn timer_refreshes_without_a_client_query_and_stops_on_shutdown() {
+        let upstream = Arc::new(TestUpstream::answering("timer", Ipv4Addr::LOCALHOST));
+        let state = build_state(vec![Arc::clone(&upstream)], Strategy::Sequential);
+        let query = wire_query("timer.example.", RecordType::A, 17);
+        handle_query(&state, &query).await;
+        handle_query(&state, &query).await;
+        state.cache.set_remaining_ttl_for_test(
+            "timer.example.",
+            RecordType::A,
+            DNSClass::IN,
+            Duration::ZERO,
+        );
+        let shutdown = CancellationToken::new();
+        start_refresh(&state, shutdown.clone());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while upstream.calls() < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(decode(&handle_query(&state, &query).await).answers[0].ttl > 0);
+        shutdown.cancel();
+        state.cache.set_remaining_ttl_for_test(
+            "timer.example.",
+            RecordType::A,
+            DNSClass::IN,
+            Duration::ZERO,
+        );
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(upstream.calls(), 2);
     }
 
     #[tokio::test]

@@ -19,6 +19,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, RwLock, Semaphore, 
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::config::{UpstreamConfig, UpstreamStrategy};
@@ -117,6 +118,13 @@ struct DotConnection {
     capacity: Arc<Semaphore>,
     last_used: AtomicU64,
     dead: AtomicBool,
+    closed: CancellationToken,
+}
+
+impl Drop for DotConnection {
+    fn drop(&mut self) {
+        self.closed.cancel();
+    }
 }
 
 impl DotConnection {
@@ -129,9 +137,24 @@ impl DotConnection {
             capacity: Arc::new(Semaphore::new(MAX_DOT_IN_FLIGHT)),
             last_used: AtomicU64::new(monotonic_millis()),
             dead: AtomicBool::new(false),
+            closed: CancellationToken::new(),
         });
-        tokio::spawn(dot_writer(Arc::downgrade(&connection), writer, write_rx));
-        tokio::spawn(dot_reader(Arc::downgrade(&connection), reader));
+        let weak = Arc::downgrade(&connection);
+        let closed = connection.closed.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = closed.cancelled() => {}
+                _ = dot_writer(weak, writer, write_rx) => {}
+            }
+        });
+        let weak = Arc::downgrade(&connection);
+        let closed = connection.closed.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = closed.cancelled() => {}
+                _ = dot_reader(weak, reader) => {}
+            }
+        });
         connection
     }
 
@@ -203,6 +226,7 @@ impl DotConnection {
         if self.dead.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.closed.cancel();
         for (_, pending) in self.pending.lock().unwrap().drain() {
             let _ = pending.reply.send(Err(error.clone()));
         }
@@ -453,7 +477,7 @@ impl DotPool {
         Message::from_vec(&response).context("failed to decode test DoT response")
     }
 
-    async fn keepalive(self: &Arc<Self>) {
+    async fn keepalive(self: &Arc<Self>) -> bool {
         let connections = {
             let mut connections = self.connections.lock().await;
             connections.retain(|connection| connection.is_alive());
@@ -464,6 +488,12 @@ impl DotPool {
         let probe = probe
             .to_vec()
             .expect("fixed root-NS keepalive query must encode");
+        if connections.is_empty() {
+            return matches!(
+                timeout(UPSTREAM_TIMEOUT, self.query_wire(&probe)).await,
+                Ok(Ok(_))
+            );
+        }
         let probes = connections.into_iter().filter_map(|connection| {
             if !connection.was_idle_for(DOT_KEEPALIVE_INTERVAL) {
                 return None;
@@ -472,27 +502,52 @@ impl DotPool {
             let probe = probe.clone();
             Some(async move {
                 match timeout(H2_KEEPALIVE_TIMEOUT, connection.query(&probe, permit)).await {
-                    Ok(Ok(_)) => {}
+                    Ok(Ok(_)) => return true,
                     Ok(Err(err)) => connection.fail(err),
                     Err(_) => connection.fail(DotFailure::Connection(
                         "DoT keepalive timed out".to_string(),
                     )),
                 }
+                false
             })
         });
-        futures_util::future::join_all(probes).await;
+        futures_util::future::join_all(probes)
+            .await
+            .into_iter()
+            .all(|healthy| healthy)
     }
 }
 
 fn start_dot_keepalive(pool: &Arc<DotPool>) {
     let pool = Arc::downgrade(pool);
     tokio::spawn(async move {
+        let mut delay = DOT_KEEPALIVE_SCAN_INTERVAL;
+        let mut retry_at = Instant::now();
         let mut interval = tokio::time::interval(DOT_KEEPALIVE_SCAN_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         interval.tick().await;
         loop {
             interval.tick().await;
             let Some(pool) = pool.upgrade() else { return };
-            pool.keepalive().await;
+            // Back off redials only: a client may have restored a connection
+            // during the outage, and that connection still needs idle probes.
+            if Instant::now() < retry_at
+                && !pool
+                    .connections
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|connection| connection.is_alive())
+            {
+                continue;
+            }
+            delay = if pool.keepalive().await {
+                DOT_KEEPALIVE_SCAN_INTERVAL
+            } else {
+                (delay * 2).min(Duration::from_secs(60))
+                    + Duration::from_millis(u64::from(rand::random::<u16>() % 1000))
+            };
+            retry_at = Instant::now() + delay;
         }
     });
 }
@@ -1409,6 +1464,68 @@ mod tests {
         assert_eq!(
             id, 9,
             "ID allocation must skip every active waiter rather than overwrite one"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_or_dropped_dot_connections_close_idle_transports() {
+        for fail in [true, false] {
+            let tls = test_tls::generate("localhost");
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (client, mut peer) = tokio::join!(
+                async {
+                    let tcp = TcpStream::connect(addr).await.unwrap();
+                    tls.connector.connect(tls.server_name, tcp).await.unwrap()
+                },
+                async {
+                    let (tcp, _) = listener.accept().await.unwrap();
+                    tls.acceptor.accept(tcp).await.unwrap()
+                }
+            );
+            let connection = DotConnection::start(client);
+            if fail {
+                connection.fail(DotFailure::Connection("test failure".to_string()));
+            } else {
+                drop(connection);
+            }
+            let mut byte = [0];
+            let read = timeout(Duration::from_secs(1), peer.read(&mut byte))
+                .await
+                .expect("idle reader/writer tasks must close the socket");
+            assert!(matches!(read, Ok(0) | Err(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn maintenance_replaces_a_dead_connection_before_the_next_query() {
+        let tls = test_tls::generate("localhost");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(mock_dot_server(
+            listener,
+            tls.acceptor,
+            Arc::clone(&accepts),
+            false,
+        ));
+        let pool = Arc::new(DotPool::new(
+            "127.0.0.1".to_string(),
+            addr.port(),
+            vec![addr].into_boxed_slice(),
+            tls.server_name,
+            tls.connector,
+        ));
+        assert!(pool.keepalive().await);
+        pool.connections.lock().await[0]
+            .fail(DotFailure::Connection("test disconnect".to_string()));
+        assert!(pool.keepalive().await);
+        assert_eq!(accepts.load(Ordering::SeqCst), 2);
+        pool.query(&test_query()).await.unwrap();
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            2,
+            "client reuses background replacement"
         );
     }
 

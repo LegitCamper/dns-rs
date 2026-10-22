@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use hickory_proto::rr::{DNSClass, RecordType};
 use linked_list_allocator::Heap;
 use rustc_hash::FxHasher;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
@@ -14,6 +15,12 @@ use super::inline_name::MAX_NAME_LEN;
 
 /// How often the background sweeper evicts entries past their stale window.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+const SWEEP_BATCH: usize = 256;
+const REFRESH_CONCURRENCY: usize = 4;
+const REFRESH_IDLE_LIMIT: Duration = Duration::from_secs(300);
+// ponytail: prefetch only the 1024 most recent entries; use a due-time queue
+// if measurements show a larger working set needs proactive refresh.
+const REFRESH_SCAN_LIMIT: usize = 1024;
 
 /// Keep expired answers available briefly while one caller refreshes them in
 /// the background. Clients receive TTL=0 on these answers, so they may use
@@ -44,7 +51,7 @@ impl KeySlot {
 }
 
 /// One cached response's bookkeeping. Both qname and wire bytes live in
-/// `CacheState::pool` at `[offset, offset + name_len + wire_len)`. Storing
+/// `CacheState::pool` followed by the original refresh request. Storing
 /// the name there lets the hash table carry only a 64-bit hash + slab index,
 /// instead of copying a fixed 255-byte `InlineName` into the hash table and
 /// twice more into the old LRU links.
@@ -52,12 +59,17 @@ struct EntryMeta {
     offset: usize,
     name_len: u16,
     wire_len: u32,
+    request_len: u16,
     record_type: RecordType,
     dns_class: DNSClass,
     flags: u8,
     expires_at: Instant,
     stale_until: Instant,
     original_ttl: Duration,
+    last_used: Instant,
+    retry_after: Instant,
+    reused: bool,
+    refresh_failures: u8,
     refresh_claimed: bool,
     prev: u32,
     next: u32,
@@ -70,6 +82,7 @@ struct EntryMeta {
 pub struct ResponseCache {
     enabled: bool,
     state: Mutex<CacheState>,
+    refresh_slots: Arc<Semaphore>,
 }
 
 struct CacheState {
@@ -113,6 +126,7 @@ impl ResponseCache {
 
         Self {
             enabled,
+            refresh_slots: Arc::new(Semaphore::new(REFRESH_CONCURRENCY)),
             state: Mutex::new(CacheState {
                 pool,
                 heap,
@@ -146,36 +160,84 @@ impl ResponseCache {
                     _ = tokio::time::sleep(interval) => {}
                     _ = shutdown.cancelled() => return,
                 }
-                this.evict_expired();
+                let started = Instant::now();
+                let end = this.state.lock().unwrap().entries.len();
+                for start in (0..end).step_by(SWEEP_BATCH) {
+                    if shutdown.is_cancelled() {
+                        return;
+                    }
+                    this.evict_expired_batch(start, (start + SWEEP_BATCH).min(end));
+                    tokio::task::yield_now().await;
+                }
+                debug!(
+                    elapsed_us = started.elapsed().as_micros() as u64,
+                    "cache sweep complete"
+                );
             }
         });
     }
 
     /// Evicts entries whose TTL plus serve-stale window has elapsed.
+    fn evict_expired_batch(&self, start: usize, end: usize) {
+        let mut state = self.state.lock().unwrap();
+        let now = Instant::now();
+        for index in start..end.min(state.entries.len()) {
+            if state.entries[index]
+                .as_ref()
+                .is_some_and(|meta| meta.stale_until <= now)
+            {
+                state.evict(index as u32);
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub fn evict_expired(&self) {
-        if !self.enabled {
-            return;
+        let end = self.state.lock().unwrap().entries.len();
+        for start in (0..end).step_by(SWEEP_BATCH) {
+            self.evict_expired_batch(start, (start + SWEEP_BATCH).min(end));
+        }
+    }
+
+    pub fn try_refresh_permit(&self) -> Option<OwnedSemaphorePermit> {
+        self.refresh_slots.clone().try_acquire_owned().ok()
+    }
+
+    /// Claims a bounded hot set without counting background work as user activity.
+    pub fn refresh_candidates(&self) -> Vec<Vec<u8>> {
+        let budget = self.refresh_slots.available_permits();
+        if !self.enabled || budget == 0 {
+            return Vec::new();
         }
         let mut state = self.state.lock().unwrap();
         let now = Instant::now();
-        let expired: Vec<u32> = state
-            .entries
-            .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| {
-                entry
-                    .as_ref()
-                    .filter(|meta| meta.stale_until <= now)
-                    .map(|_| index as u32)
-            })
-            .collect();
-        let count = expired.len();
-        for entry in expired {
-            state.evict(entry);
+        let mut requests = Vec::new();
+        let mut entry = state.lru_head;
+        for _ in 0..REFRESH_SCAN_LIMIT {
+            if entry == NONE || requests.len() == budget {
+                break;
+            }
+            let meta = state.entry(entry);
+            let next = meta.next;
+            let lead = meta.original_ttl
+                * (5 + (state.table[meta.table_slot as usize].hash % 6) as u32)
+                / 100;
+            if meta.reused
+                && meta.request_len > 0
+                && !meta.refresh_claimed
+                && meta.retry_after <= now
+                && meta.stale_until > now
+                && now.saturating_duration_since(meta.last_used) < REFRESH_IDLE_LIMIT
+                && meta.expires_at.saturating_duration_since(now) <= lead
+            {
+                let start = meta.offset + usize::from(meta.name_len) + meta.wire_len as usize;
+                let end = start + usize::from(meta.request_len);
+                requests.push(state.pool[start..end].to_vec());
+                state.entry_mut(entry).refresh_claimed = true;
+            }
+            entry = next;
         }
-        if count > 0 {
-            debug!(count, "swept expired cache entries");
-        }
+        requests
     }
 
     #[cfg(test)]
@@ -186,17 +248,18 @@ impl ResponseCache {
         dns_class: DNSClass,
     ) -> Option<(Vec<u8>, bool)> {
         self.get_with_flags(name.as_bytes(), record_type, dns_class, 0)
+            .map(|(wire, refresh, _stale)| (wire, refresh))
     }
 
     /// Returns cached wire bytes if present and not past the serve-stale
-    /// window, plus whether this caller claimed the one refresh opportunity.
+    /// window, plus refresh-claimed and stale flags.
     pub fn get_with_flags(
         &self,
         name: &[u8],
         record_type: RecordType,
         dns_class: DNSClass,
         flags: u8,
-    ) -> Option<(Vec<u8>, bool)> {
+    ) -> Option<(Vec<u8>, bool, bool)> {
         if !self.enabled || name.len() > MAX_NAME_LEN {
             return None;
         }
@@ -214,8 +277,11 @@ impl ResponseCache {
 
         state.touch(entry);
         let meta = state.entry_mut(entry);
+        meta.last_used = now;
+        meta.reused = true;
         let stale = meta.expires_at <= now;
         let should_refresh = !meta.refresh_claimed
+            && meta.retry_after <= now
             && (stale || meta.expires_at.duration_since(now) <= meta.original_ttl / 10);
         if should_refresh {
             meta.refresh_claimed = true;
@@ -231,7 +297,7 @@ impl ResponseCache {
             elapsed.as_secs().min(u64::from(u32::MAX)) as u32,
             stale,
         );
-        Some((wire, should_refresh))
+        Some((wire, should_refresh, stale))
     }
 
     #[cfg(test)]
@@ -249,7 +315,13 @@ impl ResponseCache {
         let mut state = self.state.lock().unwrap();
         let hash = key_hash(name, record_type, dns_class, flags);
         if let Locate::Found(entry) = state.locate(hash, name, record_type, dns_class, flags) {
-            state.entry_mut(entry).refresh_claimed = false;
+            let meta = state.entry_mut(entry);
+            if meta.refresh_claimed {
+                meta.refresh_claimed = false;
+                meta.refresh_failures = meta.refresh_failures.saturating_add(1).min(5);
+                let delay_ms = (1u64 << meta.refresh_failures) * 500 + hash % 500;
+                meta.retry_after = Instant::now() + Duration::from_millis(delay_ms);
+            }
         }
     }
 
@@ -294,9 +366,10 @@ impl ResponseCache {
         ttl: u32,
         wire: Vec<u8>,
     ) {
-        self.insert_with_flags(name.as_bytes(), record_type, dns_class, 0, ttl, wire);
+        self.insert_with_flags(name.as_bytes(), record_type, dns_class, 0, ttl, &wire, &[]);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_with_flags(
         &self,
         name: &[u8],
@@ -304,12 +377,19 @@ impl ResponseCache {
         dns_class: DNSClass,
         flags: u8,
         ttl: u32,
-        wire: Vec<u8>,
+        wire: &[u8],
+        request: &[u8],
     ) {
         if !self.enabled || name.len() > MAX_NAME_LEN {
             return;
         }
-        let total_len = name.len().saturating_add(wire.len());
+        let Ok(request_len) = u16::try_from(request.len()) else {
+            return;
+        };
+        let total_len = name
+            .len()
+            .saturating_add(wire.len())
+            .saturating_add(request.len());
         let Ok(layout) = Layout::from_size_align(total_len, 1) else {
             return;
         };
@@ -319,7 +399,14 @@ impl ResponseCache {
         let stale_until = expires_at + SERVE_STALE_WINDOW;
 
         let mut state = self.state.lock().unwrap();
+        if total_len > state.pool.len() {
+            return;
+        }
+        let mut last_used = Instant::now();
+        let mut reused = false;
         if let Locate::Found(entry) = state.locate(hash, name, record_type, dns_class, flags) {
+            last_used = state.entry(entry).last_used;
+            reused = state.entry(entry).reused;
             state.evict(entry);
         }
         state.ensure_table_capacity();
@@ -336,23 +423,32 @@ impl ResponseCache {
             }
         };
         let offset = ptr.as_ptr() as usize - state.pool.as_ptr() as usize;
-        // SAFETY: `ptr` was returned for exactly `total_len` bytes, with the
-        // name followed by the response; the arena never moves.
+        // SAFETY: allocation covers name, response and request; arena never moves.
         unsafe {
             std::ptr::copy_nonoverlapping(name.as_ptr(), ptr.as_ptr(), name.len());
             std::ptr::copy_nonoverlapping(wire.as_ptr(), ptr.as_ptr().add(name.len()), wire.len());
+            std::ptr::copy_nonoverlapping(
+                request.as_ptr(),
+                ptr.as_ptr().add(name.len() + wire.len()),
+                request.len(),
+            );
         }
 
         let entry = state.alloc_entry(EntryMeta {
             offset,
             name_len: name.len() as u16,
             wire_len: wire.len() as u32,
+            request_len,
             record_type,
             dns_class,
             flags,
             expires_at,
             stale_until,
             original_ttl,
+            last_used,
+            reused,
+            retry_after: Instant::now(),
+            refresh_failures: 0,
             refresh_claimed: false,
             prev: NONE,
             next: NONE,
@@ -536,7 +632,8 @@ impl CacheState {
         self.table[slot].entry = TOMBSTONE;
         self.table_len -= 1;
         self.tombstones += 1;
-        let total_len = usize::from(meta.name_len) + meta.wire_len as usize;
+        let total_len =
+            usize::from(meta.name_len) + meta.wire_len as usize + usize::from(meta.request_len);
         // SAFETY: offset/length came from one matching allocation.
         unsafe {
             let ptr = NonNull::new_unchecked(self.pool.as_mut_ptr().add(meta.offset));
@@ -783,7 +880,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_refresh_claim_can_be_released_and_claimed_again() {
+    fn failed_refresh_backs_off_before_another_claim() {
         let cache = ResponseCache::new(true, 4096);
         cache.insert("retry.example.".to_string(), A, IN, 100, vec![1]);
         cache.set_remaining_ttl_for_test("retry.example.", A, IN, Duration::from_secs(9));
@@ -793,11 +890,87 @@ mod tests {
         );
 
         cache.release_refresh_claim("retry.example.", A, IN);
+        assert!(!cache.get("retry.example.", A, IN).unwrap().1);
+        {
+            let mut state = cache.state.lock().unwrap();
+            let entry = state.lru_head;
+            state.entry_mut(entry).retry_after = Instant::now();
+        }
+        assert!(cache.get("retry.example.", A, IN).unwrap().1);
+    }
 
+    #[test]
+    fn prefetch_preserves_request_and_does_not_extend_user_activity() {
+        let cache = ResponseCache::new(true, 4096);
+        let request = b"original request including EDNS";
+        cache.insert_with_flags(b"hot.", A, IN, 3, 60, b"answer", request);
         assert!(
-            cache.get("retry.example.", A, IN).unwrap().1,
-            "a failed refresh must release its claim so a later hit can retry before expiry"
+            cache.refresh_candidates().is_empty(),
+            "one-off names stay cold"
         );
+        cache.get_with_flags(b"hot.", A, IN, 3).unwrap();
+        let last_used = {
+            let mut state = cache.state.lock().unwrap();
+            let entry = state.lru_head;
+            state.entry_mut(entry).expires_at = Instant::now();
+            state.entry(entry).last_used
+        };
+        assert_eq!(cache.refresh_candidates(), vec![request.to_vec()]);
+        assert!(
+            cache.refresh_candidates().is_empty(),
+            "claim is shared with demand refresh"
+        );
+        cache.insert_with_flags(b"hot.", A, IN, 3, 60, b"new answer", request);
+        {
+            let mut state = cache.state.lock().unwrap();
+            let entry = state.lru_head;
+            assert_eq!(state.entry(entry).last_used, last_used);
+            let meta = state.entry_mut(entry);
+            meta.last_used = Instant::now() - REFRESH_IDLE_LIMIT;
+            meta.expires_at = Instant::now();
+        }
+        assert!(
+            cache.refresh_candidates().is_empty(),
+            "inactive names stop refreshing"
+        );
+    }
+
+    #[test]
+    fn refresh_budget_is_shared_and_requests_count_toward_pool_budget() {
+        let cache = ResponseCache::new(true, 4096);
+        for i in 0..10 {
+            let name = format!("hot{i}.");
+            cache.insert_with_flags(name.as_bytes(), A, IN, 0, 60, b"answer", b"request");
+            cache.get(&name, A, IN).unwrap();
+            cache.set_remaining_ttl_for_test(&name, A, IN, Duration::ZERO);
+        }
+        assert_eq!(cache.refresh_candidates().len(), REFRESH_CONCURRENCY);
+        let permits: Vec<_> = (0..REFRESH_CONCURRENCY)
+            .map(|_| cache.try_refresh_permit().unwrap())
+            .collect();
+        assert!(cache.refresh_candidates().is_empty());
+        assert!(cache.try_refresh_permit().is_none());
+        drop(permits);
+        assert_eq!(cache.refresh_candidates().len(), REFRESH_CONCURRENCY);
+        cache.insert_with_flags(b"oversized.", A, IN, 0, 60, b"answer", &[0; 4096]);
+        assert!(cache.get("oversized.", A, IN).is_none());
+        assert!(cache.get("hot0.", A, IN).is_some());
+    }
+
+    #[test]
+    fn sweep_batches_recheck_reused_slots_before_evicting() {
+        let cache = ResponseCache::new(true, 65536);
+        for i in 0..SWEEP_BATCH + 1 {
+            let name = format!("expired{i}.");
+            cache.insert(name.clone(), A, IN, 60, vec![1]);
+            cache.expire_fully_for_test(&name, A, IN);
+        }
+        cache.evict_expired_batch(0, SWEEP_BATCH);
+        let name = format!("expired{SWEEP_BATCH}.");
+        cache.insert(name.clone(), A, IN, 60, vec![2]);
+        cache.evict_expired_batch(SWEEP_BATCH, SWEEP_BATCH + 1);
+        assert_eq!(cache.get(&name, A, IN), Some((vec![2], false)));
+        assert_eq!(cache.state.lock().unwrap().live_len(), 1);
     }
 
     #[test]

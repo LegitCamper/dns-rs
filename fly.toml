@@ -12,7 +12,7 @@ DNSRS_BLOCKLIST_URLS = 'https://raw.githubusercontent.com/StevenBlack/hosts/mast
 DNSRS_WHITELIST_REFRESH_SECS = '43200'
 DNSRS_WHITELIST_URLS = 'https://raw.githubusercontent.com/GoodnessJSON/PiHole-Whitelist/refs/heads/master/lists/optional-list.txt,https://raw.githubusercontent.com/GoodnessJSON/PiHole-Whitelist/refs/heads/master/lists/referral-sites.txt,https://raw.githubusercontent.com/GoodnessJSON/PiHole-Whitelist/refs/heads/master/lists/whitelist.txt'
 DNSRS_WHITELIST_DOMAINS = 'click.redditmail.com'
-DNSRS_UPSTREAM_STRATEGY = 'sequential'
+DNSRS_UPSTREAM_STRATEGY = 'hedged'
 DNSRS_UPSTREAM_URLS = 'https://cloudflare-dns.com/dns-query,https://dns.quad9.net/dns-query,https://anycast.uncensoreddns.org/dns-query,tls://1.1.1.1:853#cloudflare-dns.com'
 
 [[services]]

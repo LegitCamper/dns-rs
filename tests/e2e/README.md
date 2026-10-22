@@ -30,6 +30,40 @@ are not included by `all`.
 
 ## Performance measurement
 
+For tail-latency changes, `perf_tail.py` uses certificate-verified local DoH
+upstreams with controlled delays and a persistent client DoT connection. No
+public DNS traffic or host trust-store changes. It compares eight A-B-B-A
+rounds, excludes client TLS setup, and saves raw samples and binary hashes:
+
+```sh
+# Preserve the old release binary before building the changes.
+mkdir -p tests/e2e/.run/latency
+cp target/release/dns-rs tests/e2e/.run/latency/baseline
+cargo build --release --locked
+uv run tests/e2e/perf_tail.py \
+  --baseline tests/e2e/.run/latency/baseline \
+  --candidate target/release/dns-rs \
+  --rounds 8 --requests 1000 --sweep-entries 50000 --blocklist-entries 250000
+```
+
+Hot hits and ordinary misses use identical configuration. The slow-primary
+scenario compares the baseline's `sequential` deployment setting with the
+candidate's `hedged` setting (80 ms primary, 12 ms fallback). This measures the
+configuration change as well as code; it is not evidence of a faster parser.
+The idle probe queries four reused names after 33 seconds, beyond their
+two-second TTL plus 30-second stale window, and records background traffic.
+This small probe demonstrates avoided misses; its four samples do not establish
+a stable p99. Optional sweep probes fill a 64 MiB cache with 50,000 short-lived
+entries and measure static responses across two sweep intervals.
+The blocklist probe rebuilds 250,000 domains every five seconds while measuring
+static responses; on Linux it pins the DNS process to one CPU. Use `--rounds 0`
+to repeat only probes, and `--skip-idle` to omit the 33-second waits.
+
+Results land in `tests/e2e/.run/latency/perf-tail.json`; server logs are under
+`tests/e2e/.run/tail-*/server.log`. Loopback latency includes the Python client,
+fixture and OS scheduling. It does not predict Android/Fly network latency.
+Run without other builds or load tests competing for CPU.
+
 Performance runs are opt-in. They reuse one multiplexed TLS connection per DoT
 target and one persistent HTTP/1.1 `httpx.AsyncClient` per DoH target. TLS setup
 is recorded separately and excluded from steady-state samples. Measured local

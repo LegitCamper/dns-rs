@@ -271,6 +271,7 @@ pub struct BlocklistManager {
     block: DomainSet,
     allow: DomainSet,
     merged: BlockSet,
+    rebuild: tokio::sync::Mutex<()>,
 }
 
 impl BlocklistManager {
@@ -297,6 +298,7 @@ impl BlocklistManager {
             block,
             allow,
             merged: Arc::new(ArcSwap::from_pointee(DomainIndex::new())),
+            rebuild: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -352,9 +354,19 @@ impl BlocklistManager {
                 for src in &accessor(&this).sources {
                     this.fetch_and_store(src).await;
                 }
-                this.republish_merged();
+                this.republish_in_background().await;
             }
         });
+    }
+
+    async fn republish_in_background(self: &Arc<Self>) {
+        // Serialize rebuilds so block/allow timers cannot double peak memory
+        // or publish an older snapshot after a newer one.
+        let _guard = self.rebuild.lock().await;
+        let this = Arc::clone(self);
+        if let Err(err) = tokio::task::spawn_blocking(move || this.republish_merged()).await {
+            warn!(error = %err, "domain list rebuild failed, keeping previous contents");
+        }
     }
 
     async fn fetch_and_store(&self, src: &Source) {
@@ -767,6 +779,24 @@ mod tests {
             !merged.load().contains("inline-block.test."),
             "an inline whitelist entry must win over an inline blocklist entry"
         );
+    }
+
+    #[tokio::test]
+    async fn background_rebuild_keeps_whitelist_and_publishes_atomically() {
+        let config = blocklists_config(
+            vec![],
+            vec!["ads.test".to_string(), "allowed.test".to_string()],
+        );
+        let allow = whitelist_config(vec![], vec!["allowed.test".to_string()]);
+        let manager = Arc::new(BlocklistManager::new(&config, &allow));
+        let old = manager.merged.load_full();
+        tokio::join!(
+            manager.republish_in_background(),
+            manager.republish_in_background()
+        );
+        assert!(old.is_empty());
+        assert!(manager.merged.load().contains("ads.test."));
+        assert!(!manager.merged.load().contains("allowed.test."));
     }
 
     #[test]

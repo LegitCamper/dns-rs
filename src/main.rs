@@ -73,8 +73,8 @@ fn load_config(path: &Path) -> Result<LoadedConfig> {
 /// Single-threaded on purpose. The deployment target is a 1-vCPU machine
 /// (see fly.toml), where the multi-threaded runtime's work-stealing,
 /// cross-worker wakeups, and atomic bookkeeping are pure overhead with no
-/// parallelism to buy back. It also makes every mutex in the process
-/// uncontended by construction.
+/// parallelism to buy back. Request tasks share this thread; large blocklist
+/// merges use a serialized blocking worker so they cannot stall network I/O.
 ///
 /// ponytail: if this is ever deployed to a multi-core machine, the right
 /// shape is one current-thread runtime per core with SO_REUSEPORT sockets
@@ -169,6 +169,7 @@ async fn run_configured() -> Result<()> {
 
 async fn spawn_listeners(config: &Config, shutdown: CancellationToken) -> Result<Vec<Listener>> {
     let state = Arc::new(AppState::build(config, shutdown.clone()).await?);
+    dns::handler::start_refresh(&state, shutdown.clone());
 
     // Warm before binding listeners: a detached task raced the first client,
     // so the one query this optimization was meant to help could still dial

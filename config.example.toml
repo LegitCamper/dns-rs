@@ -85,4 +85,7 @@ enabled = true
 # case). Nothing about serving a request grows, shrinks, or reallocates this
 # pool. If it fills up, expired entries are evicted first, then
 # least-recently-used ones, until the next response fits.
+# Original query bytes also count toward this pool. Recently reused entries
+# refresh before expiry (four concurrent refreshes, five-minute idle cutoff).
+# Expired entries are swept in small batches; no full-cache flush is needed.
 max_size_bytes = 67108864  # 64 MiB (hard ceiling: 1 GiB)
