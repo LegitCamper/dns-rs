@@ -168,6 +168,27 @@ async def idle_probe(binary, label, upstream):
                     "queries_during_probe": upstream.count(names) - before, **result}
 
 
+async def strategy_slot(binary, label, round_id, slot_id, upstreams, requests):
+    strategy = "hedged" if label == "baseline" else "race"
+    results = []
+    for workload, order in [("healthy-primary", [0, 1, 2, 3]), ("slow-primary", [3, 0, 1, 2])]:
+        prefix = f"strategy-{round_id}-{slot_id}-{workload}"
+        names = [f"{prefix}-{i}.test." for i in range(80)]
+        counts = [upstream.count(names) for upstream in upstreams]
+        with server(binary, prefix, [upstreams[i].url for i in order], strategy) as process:
+            async with client(process) as connection:
+                if workload == "healthy-primary":
+                    results.append(await h.measure_queries(
+                        "hot", connection.query, plan([f"hot-{prefix}.test"] * requests), warmup=20))
+                result = await h.measure_queries(workload, connection.query, plan(names))
+                # Let cancelled hedges reach the fixture before counting traffic.
+                await asyncio.sleep(0.1)
+                result["upstream_queries"] = [upstream.count(names) - before
+                                              for upstream, before in zip(upstreams, counts)]
+                results.append(result)
+    return {"label": label, "strategy": strategy, "round": round_id, "slot": slot_id, "results": results}
+
+
 async def maintenance_probe(binary, label, upstream, entries):
     with server(binary, f"{label}-sweep", [upstream.url]) as process:
         async with client(process) as connection:
@@ -214,12 +235,15 @@ async def main(args):
     # Per-process trust; never install certificates into the host trust store.
     os.environ["SSL_CERT_FILE"] = str(h.CERT_PATH)
     fast, slow = Upstream(0.012), Upstream(0.080)
+    strategy_upstreams = [fast, Upstream(0.018), Upstream(0.030), slow] if args.compare_strategies else []
     binaries = [("baseline", args.baseline.resolve()), ("candidate", args.candidate.resolve())]
     evidence = {"binaries": [h.binary_metadata(label, binary) for label, binary in binaries],
                 "git_commit": h.command_text("git", "rev-parse", "HEAD"),
                 "settings": {"rounds": args.rounds, "requests": args.requests,
                              "connection": "persistent DoT; TLS setup excluded", "fast_delay_ms": 12,
                              "slow_delay_ms": 80, "cache_bytes": 64 * 1024 * 1024,
+                             "compare_strategies": args.compare_strategies,
+                             "strategy_upstream_delays_ms": [12, 18, 30, 80] if args.compare_strategies else None,
                              "limitations": "loopback fixture; p99 includes Python client and OS scheduling; slow-primary changes strategy as well as binary"}, "runs": []}
     try:
         for round_id in range(args.rounds):
@@ -227,7 +251,10 @@ async def main(args):
             for slot_id, index in enumerate(order):
                 label, binary = binaries[index]
                 print(f"round {round_id + 1}/{args.rounds} slot {slot_id} {label}", flush=True)
-                evidence["runs"].append(await slot(binary, label, round_id, slot_id, fast, slow, args.requests))
+                if args.compare_strategies:
+                    evidence["runs"].append(await strategy_slot(binary, label, round_id, slot_id, strategy_upstreams, args.requests))
+                else:
+                    evidence["runs"].append(await slot(binary, label, round_id, slot_id, fast, slow, args.requests))
         if not args.skip_idle:
             evidence["idle"] = [await idle_probe(binary, label, fast) for label, binary in binaries]
         if args.sweep_entries:
@@ -237,6 +264,8 @@ async def main(args):
     finally:
         fast.close()
         slow.close()
+        for upstream in strategy_upstreams[1:3]:
+            upstream.close()
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(evidence, indent=2) + "\n")
     errors = sum(result["summary"]["error_count"] for run in evidence["runs"] for result in run["results"])
@@ -252,10 +281,13 @@ if __name__ == "__main__":
     parser.add_argument("--rounds", type=int, default=8, help="paired rounds; zero runs only the optional probes")
     parser.add_argument("--requests", type=h.positive_int, default=1000)
     parser.add_argument("--skip-idle", action="store_true")
+    parser.add_argument("--compare-strategies", action="store_true", help="compare hedged versus race with four upstreams; use the same binary for both labels")
     parser.add_argument("--sweep-entries", type=h.positive_int)
     parser.add_argument("--blocklist-entries", type=h.positive_int)
     parser.add_argument("--output", type=Path, default=h.RUN_DIR / "latency" / "perf-tail.json")
     args = parser.parse_args()
     if args.rounds < 0:
         parser.error("--rounds must be nonnegative")
+    if args.compare_strategies and args.baseline.resolve() != args.candidate.resolve():
+        parser.error("--compare-strategies requires the same binary for both labels")
     asyncio.run(main(args))

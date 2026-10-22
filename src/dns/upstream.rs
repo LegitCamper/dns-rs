@@ -1689,6 +1689,141 @@ mod tests {
             .expect("failed to build test reqwest client")
     }
 
+    /// Controlled experiment, not a production maintenance scheduler. Run alone
+    /// in release mode; delayed TLS acceptance represents reconnect cost.
+    #[cfg(feature = "doh")]
+    #[tokio::test]
+    #[ignore = "opt-in latency experiment: cargo test --release benchmark_doh_rewarm -- --ignored --nocapture"]
+    async fn benchmark_doh_rewarm_after_disconnect() {
+        #[derive(Clone)]
+        struct DelayedAccept(Arc<AtomicUsize>);
+
+        impl<S: Send + 'static> axum_server::accept::Accept<TcpStream, S> for DelayedAccept {
+            type Stream = TcpStream;
+            type Service = S;
+            type Future = Pin<Box<dyn Future<Output = std::io::Result<(TcpStream, S)>> + Send>>;
+
+            fn accept(&self, stream: TcpStream, service: S) -> Self::Future {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    stream.set_nodelay(true)?;
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    Ok((stream, service))
+                })
+            }
+        }
+
+        async fn answer(version: axum::http::Version, body: Bytes) -> Response {
+            assert_eq!(version, axum::http::Version::HTTP_2);
+            Message::from_vec(&body).expect("valid DNS query");
+            tokio::time::sleep(Duration::from_millis(12)).await;
+            let mut wire = body.to_vec();
+            wire[2] |= 0x80;
+            ([(header::CONTENT_TYPE, "application/dns-message")], wire).into_response()
+        }
+
+        async fn start(
+            addr: SocketAddr,
+            tls: Arc<rustls::ServerConfig>,
+            accepts: Arc<AtomicUsize>,
+        ) -> (axum_server::Handle<SocketAddr>, tokio::task::JoinHandle<()>) {
+            let listener = TcpListener::bind(addr).await.unwrap().into_std().unwrap();
+            let handle = axum_server::Handle::new();
+            let server = axum_server::from_tcp_rustls(listener, RustlsConfig::from_config(tls))
+                .unwrap()
+                .map(|acceptor| acceptor.acceptor(DelayedAccept(accepts)))
+                .handle(handle.clone());
+            let task = tokio::spawn(async move {
+                server
+                    .serve(
+                        Router::new()
+                            .route("/dns-query", post(answer))
+                            .into_make_service(),
+                    )
+                    .await
+                    .unwrap();
+            });
+            handle.listening().await.unwrap();
+            (handle, task)
+        }
+
+        let tls = test_tls::generate("127.0.0.1");
+        let mut config = (*tls.server_config).clone();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        let config = Arc::new(config);
+        let mut cold_ms = Vec::new();
+        let mut warm_ms = Vec::new();
+        let mut probe_ms = Vec::new();
+        for round in 0..64 {
+            for warm in if round % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            } {
+                let accepts = Arc::new(AtomicUsize::new(0));
+                let (handle, task) = start(
+                    "127.0.0.1:0".parse().unwrap(),
+                    Arc::clone(&config),
+                    Arc::clone(&accepts),
+                )
+                .await;
+                let addr = handle.listening().await.unwrap();
+                let upstream = SingleUpstream {
+                    label: "rewarm-benchmark".to_string(),
+                    backend: Backend::Doh {
+                        url: format!("https://127.0.0.1:{}/dns-query", addr.port()),
+                        http: reqwest::Client::builder()
+                            .add_root_certificate(
+                                reqwest::Certificate::from_pem(&tls.cert_pem).unwrap(),
+                            )
+                            .timeout(UPSTREAM_TIMEOUT)
+                            .http2_keep_alive_interval(H2_KEEPALIVE_INTERVAL)
+                            .http2_keep_alive_timeout(H2_KEEPALIVE_TIMEOUT)
+                            .http2_keep_alive_while_idle(true)
+                            .pool_idle_timeout(None)
+                            .build()
+                            .unwrap(),
+                    },
+                };
+                upstream.warm().await.unwrap();
+                assert_eq!(accepts.load(Ordering::SeqCst), 1);
+                handle.shutdown();
+                task.await.unwrap();
+                let (replacement, task) =
+                    start(addr, Arc::clone(&config), Arc::clone(&accepts)).await;
+                // Allow the client to observe EOF without introducing a probe.
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                assert_eq!(accepts.load(Ordering::SeqCst), 1);
+                if warm {
+                    let started = Instant::now();
+                    upstream.warm().await.unwrap();
+                    probe_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+                    assert_eq!(accepts.load(Ordering::SeqCst), 2);
+                }
+                let query = test_query().to_vec().unwrap();
+                let started = Instant::now();
+                let response = upstream.resolve(&query).await.unwrap();
+                let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                assert!(QuestionKey::from_wire(&query).unwrap().matches(&response));
+                assert_eq!(
+                    accepts.load(Ordering::SeqCst),
+                    2,
+                    "query must reuse warmed replacement"
+                );
+                if warm {
+                    warm_ms.push(elapsed);
+                } else {
+                    cold_ms.push(elapsed);
+                }
+                replacement.shutdown();
+                task.await.unwrap();
+            }
+        }
+        println!(
+            "DOH_REWARM_RESULT {{\"accept_delay_ms\":40,\"answer_delay_ms\":12,\"cold_ms\":{cold_ms:?},\"warm_ms\":{warm_ms:?},\"probe_ms\":{probe_ms:?}}}"
+        );
+    }
+
     #[cfg(feature = "doh")]
     #[tokio::test]
     async fn doh_retries_once_after_a_body_read_failure_then_succeeds() {

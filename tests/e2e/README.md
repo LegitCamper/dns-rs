@@ -64,6 +64,40 @@ Results land in `tests/e2e/.run/latency/perf-tail.json`; server logs are under
 fixture and OS scheduling. It does not predict Android/Fly network latency.
 Run without other builds or load tests competing for CPU.
 
+To compare upstream strategies without changing production configuration:
+
+```sh
+uv run tests/e2e/perf_tail.py \
+  --baseline target/release/dns-rs --candidate target/release/dns-rs \
+  --compare-strategies --skip-idle --rounds 8 --requests 1000 \
+  --output tests/e2e/.run/latency/strategies.json
+```
+
+Here `baseline` means `hedged` and `candidate` means `race`, using the same
+binary. Four local HTTPS/HTTP/1.1 upstreams delay answers by 12, 18, 30 and
+80 milliseconds. The healthy-primary order starts with the fastest upstream;
+the slow-primary order starts with the slowest. Each slot measures 1000
+warmed hits and 80 unique misses per order,
+and counts upstream requests for those misses. Results isolate scheduling
+under controlled delays, not public resolver performance or HTTP/2 behavior.
+
+An independent opt-in experiment exercises real TLS/HTTP/2 DoH reconnection:
+
+```sh
+cargo test --release --locked benchmark_doh_rewarm -- --ignored --nocapture
+```
+
+Across 64 alternating pairs, it establishes a pooled connection, shuts down
+the upstream, restarts it at the same address, and measures the next query
+with or without a preceding root-NS warm probe. The fixture delays TLS
+acceptance by 40 milliseconds and answers by 12 milliseconds. Both delays
+are artificial. Assertions require HTTP/2,
+successful DNS validation, and exactly one replacement connection reused by
+the warmed query. `DOH_REWARM_RESULT` contains raw timings, including probe
+cost. This tests the warm primitive, not a periodic production scheduler or
+silent network blackholes; report medians rather than treating 64 samples as
+a stable p99. Run separately from the strategy benchmark.
+
 Performance runs are opt-in. They reuse one multiplexed TLS connection per DoT
 target and one persistent HTTP/1.1 `httpx.AsyncClient` per DoH target. TLS setup
 is recorded separately and excluded from steady-state samples. Measured local
